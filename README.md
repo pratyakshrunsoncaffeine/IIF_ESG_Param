@@ -23,7 +23,7 @@ Each E, S and G report-evidence score runs from 0 to 7. The overall company rank
 
 ## News coverage
 
-GDELT and Google News RSS are discovery sources, restricted to the approved publisher list above. The prototype covers a recent search window of up to 90 days and reports source coverage and errors. It is not a complete 12-month news archive. Google News RSS is best effort and its feed format and history can change. Verify source identity, direct article URL, date, company identity, allegation status, outcome, company response and whether coverage is syndicated before recording an incident. Publisher inclusion is a source-quality screen, not proof that an allegation is true.
+GDELT and the India edition of Google News RSS are discovery sources, restricted to the approved publisher list above. GDELT queries are limited to India-origin coverage. The prototype covers a recent search window of up to 90 days and reports source coverage and errors. It is not a complete 12-month news archive. Google News RSS is best effort and its feed format and history can change. Verify source identity, direct article URL, date, company identity, allegation status, outcome, company response and whether coverage is syndicated before recording an incident. Publisher inclusion is a source-quality screen, not proof that an allegation is true.
 
 ## Limitations
 

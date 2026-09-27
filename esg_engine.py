@@ -208,7 +208,7 @@ def scan_news_for_company(company: dict, scan_end: date | None = None) -> tuple[
         term_block = " OR ".join(f'"{term}"' if " " in term else term for term in terms[:18])
         for entity in entities:
             params = {
-                "query": f'"{entity}" ({term_block}) ({domain_block})', "mode": "artlist", "format": "json", "maxrecords": 250,
+                "query": f'"{entity}" ({term_block}) ({domain_block}) sourcecountry:IN', "mode": "artlist", "format": "json", "maxrecords": 250,
                 "startdatetime": source_start.strftime("%Y%m%d000000"), "enddatetime": scan_end.strftime("%Y%m%d235959"), "sort": "datedesc",
             }
             try:
