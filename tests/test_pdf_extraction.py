@@ -25,6 +25,7 @@ def test_embedded_text_and_page_numbers(tmp_path):
     assert rows[0]["source_file"] == path.name
     assert rows[0]["value"] == 125400
     assert rows[0]["matched_sentence"].startswith("Scope 1")
+    assert "raw_text" not in rows[0] and "cleaned_text" not in rows[0]
 
 
 def test_table_row_with_period_headers():
