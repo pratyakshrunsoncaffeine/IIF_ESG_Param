@@ -1,0 +1,8 @@
+streamlit>=1.40,<2
+pandas>=2.2,<3
+PyMuPDF>=1.26
+requests>=2.32
+transformers>=4.45,<5
+torch>=2.4
+trafilatura>=2.0
+langdetect>=1.0.9
