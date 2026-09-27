@@ -1,0 +1,3 @@
+[server]
+# Disable source watching to avoid reload races during Cloud deployment.
+fileWatcherType = "none"
