@@ -324,7 +324,10 @@ if analysis:
             st.dataframe(pd.DataFrame(analysis["dataset_errors"]), hide_index=True, use_container_width=True)
     if analysis["dataset_files"]:
         downloads = analysis["dataset_files"]
-        st.download_button("Download ESG dataset Excel workbook", downloads["xlsx"], "iif_esg_backend_dataset.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if "xlsx" in downloads:
+            st.download_button("Download ESG dataset Excel workbook", downloads["xlsx"], "iif_esg_backend_dataset.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.info("Excel export is temporarily unavailable while the workbook dependency loads. CSV and JSON downloads are ready.")
         st.download_button("Download ESG dataset CSV", downloads["csv"], "iif_esg_backend_dataset.csv", "text/csv")
         st.download_button("Download ESG dataset JSON", downloads["json"], "iif_esg_backend_dataset.json", "application/json")
     if not analysis["news"].empty:
