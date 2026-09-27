@@ -298,7 +298,7 @@ def classify_news(candidates: pd.DataFrame, classifier) -> pd.DataFrame:
                     downloaded = trafilatura.fetch_url(result.loc[idx, "url"])
                     body = trafilatura.extract(downloaded, include_comments=False, include_tables=False, favor_recall=True) if downloaded else ""
                     if body:
-                        result.loc[idx, "article_text"] = body[:10000]
+                        result.loc[idx, "article_text"] = body[:5000]
                         result.loc[idx, "fetch_status"] = "article text retrieved"
                     else:
                         result.loc[idx, "fetch_status"] = "publisher article unavailable; headline used"
@@ -326,7 +326,7 @@ def classify_news(candidates: pd.DataFrame, classifier) -> pd.DataFrame:
     english_indices = list(result.index[result["detected_language"].eq("en")])
     if english_indices:
         texts = [str(result.loc[idx, "article_text"] or result.loc[idx, "title"])[:4000] for idx in english_indices]
-        predictions = classifier(texts, top_k=None, truncation=True, max_length=512, batch_size=8)
+        predictions = classifier(texts, top_k=None, truncation=True, max_length=512, batch_size=4)
         for idx, prediction in zip(english_indices, predictions):
             scores = {item["label"].lower(): float(item["score"]) for item in prediction}
             label = max(scores, key=scores.get)

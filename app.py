@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib
+import os
 import tempfile
+import time
 import uuid
 from datetime import date
 from pathlib import Path
@@ -9,19 +11,23 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 def _load_esg_engine():
-    """Retry once if Streamlit's source watcher evicts the module during import."""
-    try:
-        return importlib.import_module("esg_engine")
-    except KeyError as exc:
-        # Streamlit can clear local modules from sys.modules while syncing a GitHub
-        # update. Python 3.14 may surface that race as KeyError instead of retrying.
-        missing_module = str(exc.args[0]) if exc.args else ""
-        if missing_module != "esg_engine" and not missing_module.startswith("esg."):
-            raise
-        importlib.invalidate_caches()
-        return importlib.import_module("esg_engine")
+    """Retry transient module-cache races while Community Cloud refreshes code."""
+    for attempt in range(6):
+        try:
+            return importlib.import_module("esg_engine")
+        except KeyError as exc:
+            # Python 3.14 may expose Streamlit's concurrent sys.modules cleanup
+            # as KeyError when a module is being imported during a code refresh.
+            missing_module = str(exc.args[0]) if exc.args else ""
+            if missing_module != "esg_engine" and not missing_module.startswith("esg."):
+                raise
+            if attempt == 5:
+                raise
+            importlib.invalidate_caches()
+            time.sleep(0.25 * (attempt + 1))
 
 
 _engine = _load_esg_engine()
@@ -48,7 +54,9 @@ st.set_page_config(page_title="IIF ESG Parameterization", page_icon="🌱", layo
 
 @st.cache_resource(show_spinner="Loading FinBERT model...")
 def load_finbert():
+    import torch
     from transformers import pipeline
+    torch.set_num_threads(min(2, torch.get_num_threads()))
     return pipeline("text-classification", model="ProsusAI/finbert", tokenizer="ProsusAI/finbert", device=-1)
 
 
