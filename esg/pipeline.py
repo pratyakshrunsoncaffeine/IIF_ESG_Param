@@ -126,7 +126,7 @@ def process_pdf(path: Path, matcher: KeywordMatcher, settings, *, ocr: bool,
     records = []
     display_name = source_name or path.name
     try:
-        table_document = pdfplumber.open(path)
+        table_document = None
     except Exception as exc:
         table_document = None
         errors.append({"source_file": display_name, "page_number": None,
