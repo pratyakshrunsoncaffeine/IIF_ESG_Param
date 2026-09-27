@@ -1,20 +1,35 @@
 from __future__ import annotations
 
+import importlib
 from datetime import date
 from io import BytesIO
 
 import pandas as pd
 import streamlit as st
-from esg_engine import (
-    NEGATIVE_REVIEW_THRESHOLD,
-    TAXONOMY,
-    apply_incidents_and_rank,
-    calculate_document_scores,
-    classify_news,
-    collect_report_evidence,
-    extract_pdf_pages,
-    scan_news_for_company,
-)
+
+
+def _load_esg_engine():
+    """Retry once if Streamlit's source watcher evicts the module during import."""
+    try:
+        return importlib.import_module("esg_engine")
+    except KeyError as exc:
+        # Streamlit can clear local modules from sys.modules while syncing a GitHub
+        # update. Python 3.14 may surface that race as KeyError instead of retrying.
+        if exc.args != ("esg_engine",):
+            raise
+        importlib.invalidate_caches()
+        return importlib.import_module("esg_engine")
+
+
+_engine = _load_esg_engine()
+NEGATIVE_REVIEW_THRESHOLD = _engine.NEGATIVE_REVIEW_THRESHOLD
+TAXONOMY = _engine.TAXONOMY
+apply_incidents_and_rank = _engine.apply_incidents_and_rank
+calculate_document_scores = _engine.calculate_document_scores
+classify_news = _engine.classify_news
+collect_report_evidence = _engine.collect_report_evidence
+extract_pdf_pages = _engine.extract_pdf_pages
+scan_news_for_company = _engine.scan_news_for_company
 
 st.set_page_config(page_title="IIF ESG Parameterization", page_icon="🌱", layout="wide")
 
