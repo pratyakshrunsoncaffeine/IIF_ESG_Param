@@ -1,6 +1,6 @@
 # IIF ESG Parameterization Framework
 
-A Streamlit app and Jupyter Notebook prototype for reviewing ESG evidence across several companies. Upload one PDF per company, enter tickers in the report mapping table, search GDELT and Google News RSS for candidate adverse coverage, classify English candidates with FinBERT, and compare provisional scores.
+A Streamlit app and Jupyter Notebook prototype for reviewing ESG evidence across several companies. Upload one PDF per company, enter tickers in the report mapping table, search GDELT and Google News RSS for adverse coverage from a defined Indian business-news publisher list, classify English candidates with FinBERT, and compare provisional scores.
 
 ## Run locally
 
@@ -19,11 +19,11 @@ Deploy `app.py` from the root of this repository and keep the repository and app
 
 ## Scoring and review
 
-Each E, S and G report-evidence score runs from 0 to 7. The overall company ranking sums the three adjusted pillar scores for a maximum of 21. This is a prototype disclosure-evidence ranking, not a verified ESG performance rating. FinBERT negative sentiment is a review flag, not proof of misconduct and does not automatically reduce a score. Analysts must confirm incidents and provide five independent sources or a final regulator finding, court judgment or official sanction.
+Each E, S and G report-evidence score runs from 0 to 7. The overall company ranking sums the three adjusted pillar scores for a maximum of 21. This is a prototype disclosure-evidence ranking, not a verified ESG performance rating. FinBERT negative sentiment is a review flag, not proof of misconduct and does not automatically reduce a score. The approved publisher groups are The Economic Times, Business Standard, Mint, Moneycontrol, Reuters and PTI. A news-reported incident requires direct article URLs from five distinct approved publisher groups; each group counts once, and syndicated or repeated copies of the same report must not be counted as independent evidence. The sole one-document exception is an HTTPS URL on a `.gov.in`, `.nic.in` or `rbi.org.in` domain to a final regulator order or sanction, final court judgment, or final statutory authority decision. Preliminary notices, allegations, company statements and ordinary filings do not meet this exception.
 
 ## News coverage
 
-GDELT and Google News RSS are discovery sources. The prototype covers a recent search window of up to 90 days and reports source coverage and errors. It is not a complete 12-month news archive. Google News RSS is best effort and its feed format and history can change. Verify source quality, article date, company identity, allegation status, outcomes, company response and duplicates before recording an incident.
+GDELT and Google News RSS are discovery sources, restricted to the approved publisher list above. The prototype covers a recent search window of up to 90 days and reports source coverage and errors. It is not a complete 12-month news archive. Google News RSS is best effort and its feed format and history can change. Verify source identity, direct article URL, date, company identity, allegation status, outcome, company response and whether coverage is syndicated before recording an incident. Publisher inclusion is a source-quality screen, not proof that an allegation is true.
 
 ## Limitations
 

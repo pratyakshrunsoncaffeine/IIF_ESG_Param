@@ -28,6 +28,25 @@ NEWS_SOURCE_WINDOW_DAYS = 90
 NEGATIVE_REVIEW_THRESHOLD = 0.70
 MAX_ARTICLE_FETCHES_PER_COMPANY = 20
 
+# Only these Indian business-news publishers are admitted to the adverse-news
+# candidate set. Reuters and PTI are separate publisher groups; syndication or
+# republication of one story should still be treated as one underlying source.
+APPROVED_NEWS_PUBLISHERS = {
+    "The Economic Times": ("economictimes.indiatimes.com", "economictimes.com"),
+    "Business Standard": ("business-standard.com",),
+    "Mint": ("livemint.com",),
+    "Moneycontrol": ("moneycontrol.com",),
+    "Reuters": ("reuters.com",),
+    "PTI": ("ptinews.com", "pti.in"),
+}
+NEWS_SOURCE_DOMAINS = tuple(domain for domains in APPROVED_NEWS_PUBLISHERS.values() for domain in domains)
+FINAL_OFFICIAL_STATUSES = {
+    "final regulator order or sanction",
+    "final court judgment",
+    "final statutory authority decision",
+}
+OFFICIAL_RECORD_DOMAINS = ("gov.in", "nic.in", "rbi.org.in")
+
 NUMBER_PATTERN = re.compile(
     r"(?<!\w)(?:\d[\d,]*(?:\.\d+)?%?|\d+(?:\.\d+)?\s*(?:tonnes?|tons?|tCO2e|MWh|GWh|kWh|litres?|kilolitres?|employees?|beneficiaries))(?!\w)", re.I
 )
@@ -123,6 +142,41 @@ def canonical_url(url: str) -> str:
     return urlunparse((parsed.scheme.lower(), parsed.netloc.lower().removeprefix("www."), parsed.path.rstrip("/"), "", urlencode(clean_query), ""))
 
 
+def publisher_group(value: str) -> str:
+    """Map an article host or Google News source label to an approved publisher."""
+    raw = str(value or "").strip()
+    host = urlparse(raw if "://" in raw else f"https://{raw}").netloc.lower().removeprefix("www.")
+    for publisher, domains in APPROVED_NEWS_PUBLISHERS.items():
+        if any(host == domain or host.endswith(f".{domain}") for domain in domains):
+            return publisher
+    normalized = re.sub(r"[^a-z]", "", raw.lower())
+    aliases = {
+        "theeconomictimes": "The Economic Times", "economictimes": "The Economic Times",
+        "businessstandard": "Business Standard", "mint": "Mint", "livemint": "Mint",
+        "moneycontrol": "Moneycontrol", "reuters": "Reuters",
+        "presstrustofindia": "PTI", "pti": "PTI",
+    }
+    return aliases.get(normalized, "")
+
+
+def count_approved_publishers(source_urls: str) -> int:
+    """Count distinct approved publisher groups from one direct article URL per line."""
+    groups = set()
+    for url in re.split(r"[\n;]+", str(source_urls or "")):
+        url = url.strip()
+        if url:
+            group = publisher_group(url)
+            if group:
+                groups.add(group)
+    return len(groups)
+
+
+def is_official_record_url(value: str) -> bool:
+    parsed = urlparse(str(value or "").strip())
+    host = parsed.netloc.lower().removeprefix("www.")
+    return parsed.scheme == "https" and any(host == domain or host.endswith(f".{domain}") for domain in OFFICIAL_RECORD_DOMAINS)
+
+
 def _news_entities(company: dict) -> list[str]:
     values = ([company["company_name"]] if company.get("company_name") else [company["ticker"]]) + company.get("aliases", [])
     return list(dict.fromkeys(value.strip() for value in values if value and value.strip()))
@@ -134,7 +188,7 @@ def _deduplicate_news(frame: pd.DataFrame) -> pd.DataFrame:
     frame = frame.drop_duplicates(subset=["ticker", "pillar", "canonical_url"]).reset_index(drop=True)
     kept = []
     for idx, row in frame.sort_values("published_at", ascending=False).iterrows():
-        duplicate = any(row["ticker"] == frame.loc[prior, "ticker"] and row["pillar"] == frame.loc[prior, "pillar"] and SequenceMatcher(None, row["title"].lower(), frame.loc[prior, "title"].lower()).ratio() >= 0.94 for prior in kept)
+        duplicate = any(row["ticker"] == frame.loc[prior, "ticker"] and row["pillar"] == frame.loc[prior, "pillar"] and row.get("publisher", "") == frame.loc[prior].get("publisher", "") and SequenceMatcher(None, row["title"].lower(), frame.loc[prior, "title"].lower()).ratio() >= 0.94 for prior in kept)
         if not duplicate:
             kept.append(idx)
     return frame.loc[kept].reset_index(drop=True)
@@ -146,13 +200,15 @@ def scan_news_for_company(company: dict, scan_end: date | None = None) -> tuple[
     source_start = max(requested_start, scan_end - timedelta(days=NEWS_SOURCE_WINDOW_DAYS - 1))
     entities = _news_entities(company)
     articles, errors, coverage = [], [], []
+    domain_block = " OR ".join(f"domain:{domain}" for domain in NEWS_SOURCE_DOMAINS)
+    site_block = " OR ".join(f"site:{domain}" for domain in NEWS_SOURCE_DOMAINS)
     session = requests.Session()
     session.headers.update({"User-Agent": "IIF-ESG-Research/0.1"})
     for pillar, terms in NEWS_EVENT_TERMS.items():
         term_block = " OR ".join(f'"{term}"' if " " in term else term for term in terms[:18])
         for entity in entities:
             params = {
-                "query": f'"{entity}" ({term_block})', "mode": "artlist", "format": "json", "maxrecords": 250,
+                "query": f'"{entity}" ({term_block}) ({domain_block})', "mode": "artlist", "format": "json", "maxrecords": 250,
                 "startdatetime": source_start.strftime("%Y%m%d000000"), "enddatetime": scan_end.strftime("%Y%m%d235959"), "sort": "datedesc",
             }
             try:
@@ -161,19 +217,23 @@ def scan_news_for_company(company: dict, scan_end: date | None = None) -> tuple[
                 for item in response.json().get("articles", []):
                     url, title = item.get("url"), item.get("title", "").strip()
                     if url and title:
+                        host = (item.get("domain") or urlparse(url).netloc).lower().removeprefix("www.")
+                        publisher = publisher_group(host)
+                        if not publisher:
+                            continue
                         articles.append({"ticker": company["ticker"], "company_name": company.get("company_name", ""), "pillar": pillar, "query_entity": entity,
-                            "title": title, "url": url, "canonical_url": canonical_url(url), "domain": item.get("domain", urlparse(url).netloc),
+                            "title": title, "url": url, "canonical_url": canonical_url(url), "domain": host, "publisher": publisher,
                             "published_at": item.get("seendate", ""), "language": item.get("language", ""), "source_country": item.get("sourcecountry", ""), "discovery_source": "GDELT"})
             except Exception as exc:
                 errors.append({"ticker": company["ticker"], "source": "GDELT", "pillar": pillar, "query": entity, "error": f"{type(exc).__name__}: {str(exc)[:250]}"})
             time.sleep(0.15)
     coverage.append({"ticker": company["ticker"], "source": "GDELT", "requested_start": requested_start.isoformat(), "source_start": source_start.isoformat(), "source_end": scan_end.isoformat(),
-        "coverage_complete": source_start <= requested_start, "coverage_note": "Recent article-list window only; older requested dates are not covered" if source_start > requested_start else "Requested interval queried; gaps still apply"})
+        "coverage_complete": source_start <= requested_start, "coverage_note": "Approved publishers only: Economic Times, Business Standard, Mint, Moneycontrol, Reuters and PTI. Recent article-list window only; older requested dates are not covered"})
 
     for pillar, terms in NEWS_EVENT_TERMS.items():
         term_block = " OR ".join(f'"{term}"' if " " in term else term for term in terms[:12])
         for entity in entities:
-            query = f'"{entity}" ({term_block}) after:{source_start.isoformat()} before:{(scan_end + timedelta(days=1)).isoformat()}'
+            query = f'"{entity}" ({term_block}) ({site_block}) after:{source_start.isoformat()} before:{(scan_end + timedelta(days=1)).isoformat()}'
             url = "https://news.google.com/rss/search?" + urlencode({"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"})
             try:
                 response = session.get(url, timeout=25)
@@ -185,18 +245,21 @@ def scan_news_for_company(company: dict, scan_end: date | None = None) -> tuple[
                         continue
                     source = item.find("source")
                     source_name = source.text.strip() if source is not None and source.text else ""
+                    publisher = publisher_group(source_name) or publisher_group(link)
+                    if not publisher:
+                        continue
                     try:
                         published = parsedate_to_datetime(item.findtext("pubDate", default="")).isoformat()
                     except Exception:
                         published = item.findtext("pubDate", default="")
                     articles.append({"ticker": company["ticker"], "company_name": company.get("company_name", ""), "pillar": pillar, "query_entity": entity,
-                        "title": title, "url": link, "canonical_url": canonical_url(link), "domain": source_name or urlparse(link).netloc,
+                        "title": title, "url": link, "canonical_url": canonical_url(link), "domain": source_name or urlparse(link).netloc, "publisher": publisher,
                         "published_at": published, "language": "", "source_country": "India", "discovery_source": "Google News RSS"})
             except Exception as exc:
                 errors.append({"ticker": company["ticker"], "source": "Google News RSS", "pillar": pillar, "query": entity, "error": f"{type(exc).__name__}: {str(exc)[:250]}"})
             time.sleep(0.15)
     coverage.append({"ticker": company["ticker"], "source": "Google News RSS", "requested_start": requested_start.isoformat(), "source_start": source_start.isoformat(), "source_end": scan_end.isoformat(),
-        "coverage_complete": False, "coverage_note": "Best-effort RSS results; result cap, feed format and historical coverage are not guaranteed"})
+        "coverage_complete": False, "coverage_note": "Best-effort RSS results from approved publishers only; result cap, feed format and historical coverage are not guaranteed"})
     return _deduplicate_news(pd.DataFrame(articles)), pd.DataFrame(errors), pd.DataFrame(coverage)
 
 
@@ -261,7 +324,6 @@ def classify_news(candidates: pd.DataFrame, classifier) -> pd.DataFrame:
 def apply_incidents_and_rank(document_scores: pd.DataFrame, incidents: pd.DataFrame, news: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     pillars = list(PILLAR_NAMES)
     penalties = {(ticker, pillar): 0.0 for ticker in document_scores["ticker"].unique() for pillar in pillars}
-    authoritative = {"final regulator finding", "final court judgment", "official sanction"}
     if not incidents.empty:
         for _, item in incidents.iterrows():
             ticker, pillar = str(item.get("ticker", "")).strip().upper(), item.get("pillar", "")
@@ -274,10 +336,12 @@ def apply_incidents_and_rank(document_scores: pd.DataFrame, incidents: pd.DataFr
                 continue
             if bool(item.get("already_in_metric", False)):
                 continue
-            sources = int(item.get("source_count", 0) or 0)
+            sources = count_approved_publishers(item.get("source_urls", ""))
             status = str(item.get("status", "")).strip().lower()
-            if sources < 5 and status not in authoritative:
-                raise ValueError(f"Incident for {ticker} needs five independent sources or a final official finding.")
+            official_url = str(item.get("official_record_url", "")).strip()
+            valid_official_url = is_official_record_url(official_url)
+            if sources < 5 and not (status in FINAL_OFFICIAL_STATUSES and valid_official_url):
+                raise ValueError(f"Incident for {ticker} needs direct URLs from five distinct approved publishers, or a URL to a final regulator order or sanction, final court judgment, or final statutory authority decision.")
             severity = float(item.get("severity_points", 0) or 0)
             if severity not in {0.5, 1.0, 2.0}:
                 raise ValueError("Use a severity adjustment of 0.5, 1.0 or 2.0 points.")

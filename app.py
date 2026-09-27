@@ -27,7 +27,8 @@ st.title("IIF ESG Parameterization Framework")
 st.caption("Upload reports, review topic evidence and adverse-news candidates, then compare provisional company scores.")
 
 with st.expander("How this prototype scores companies", expanded=False):
-    st.write("Each E, S and G score runs from 0 to 7 and measures evidence found in the uploaded report. The overall ranking is out of 21. Negative news is surfaced for analyst review and does not reduce a score automatically. Confirmed incident adjustments require five independent sources or a final official finding.")
+    st.write("Each E, S and G score runs from 0 to 7 and measures evidence found in the uploaded report. The overall ranking is out of 21. Negative news is surfaced for analyst review and does not reduce a score automatically. The news scan admits only The Economic Times, Business Standard, Mint, Moneycontrol, Reuters and PTI.")
+    st.write("To confirm a news-reported incident, enter direct article URLs from five distinct approved publishers. Count each publisher once and exclude syndicated or repeated copies of the same report. The only one-document exception is an HTTPS link on a .gov.in, .nic.in or rbi.org.in domain to a final regulator order or sanction, final court judgment, or final statutory authority decision. Preliminary notices, allegations, company statements and ordinary filings do not qualify as final findings.")
     st.warning(TAXONOMY.get("note", "Review the topic dictionaries before relying on comparisons."))
 
 st.subheader("1. Upload reports")
@@ -159,7 +160,7 @@ if analysis:
         st.markdown("**News source coverage**")
         st.dataframe(analysis["coverage"], hide_index=True, use_container_width=True)
     if not analysis["news"].empty:
-        display_columns = [col for col in ["ticker", "pillar", "title", "domain", "published_at", "discovery_source", "detected_language", "finbert_label", "finbert_negative_probability", "needs_analyst_review", "url"] if col in analysis["news"].columns]
+        display_columns = [col for col in ["ticker", "pillar", "title", "publisher", "domain", "published_at", "discovery_source", "detected_language", "finbert_label", "finbert_negative_probability", "needs_analyst_review", "url"] if col in analysis["news"].columns]
         st.dataframe(analysis["news"][display_columns].sort_values(["ticker", "finbert_negative_probability"], ascending=[True, False], na_position="last"), hide_index=True, use_container_width=True)
     elif run_news:
         st.info("No news candidates returned. Review the coverage and query errors before interpreting this as no adverse news.")
@@ -168,8 +169,8 @@ if analysis:
             st.dataframe(analysis["errors"], hide_index=True, use_container_width=True)
 
     st.subheader("3. Record analyst-confirmed incidents")
-    st.caption("Enter one row per underlying event, not per article. An adjustment requires analyst confirmation and five independent sources, or a final regulator finding, court judgment or official sanction.")
-    incident_columns = ["ticker", "pillar", "severity_points", "status", "source_count", "summary", "already_in_metric", "analyst_confirmed"]
+    st.caption("Enter one row per underlying event, not per article. Paste one direct article URL per line in Source URLs. The app counts distinct approved publisher groups and applies one rule: five of six listed publishers, or an HTTPS URL on a .gov.in, .nic.in or rbi.org.in domain to a final regulator order or sanction, final court judgment, or final statutory authority decision.")
+    incident_columns = ["ticker", "pillar", "severity_points", "status", "source_urls", "official_record_url", "summary", "already_in_metric", "analyst_confirmed"]
     incident_defaults = pd.DataFrame(columns=incident_columns)
     if "iif_esg_incidents" not in st.session_state:
         st.session_state["iif_esg_incidents"] = incident_defaults
@@ -183,8 +184,9 @@ if analysis:
             "ticker": st.column_config.SelectboxColumn(options=[company["ticker"] for company in analysis["companies"]], required=True),
             "pillar": st.column_config.SelectboxColumn(options=["E", "S", "G"], required=True),
             "severity_points": st.column_config.SelectboxColumn(options=[0.5, 1.0, 2.0]),
-            "status": st.column_config.TextColumn(help="Use 'final regulator finding', 'final court judgment' or 'official sanction' for a single authoritative source."),
-            "source_count": st.column_config.NumberColumn(min_value=0, step=1),
+            "status": st.column_config.SelectboxColumn(options=["news reports", "final regulator order or sanction", "final court judgment", "final statutory authority decision"], required=True),
+            "source_urls": st.column_config.TextColumn(help="One direct article URL per line. Only the approved six publisher groups count, and each group counts once."),
+            "official_record_url": st.column_config.TextColumn(help="Link directly to the final official decision document. Required for the one-document exception."),
             "summary": st.column_config.TextColumn(),
             "already_in_metric": st.column_config.CheckboxColumn(),
             "analyst_confirmed": st.column_config.CheckboxColumn(help="Only confirmed rows can change scores."),
