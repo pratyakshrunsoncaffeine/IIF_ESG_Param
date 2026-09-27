@@ -95,7 +95,7 @@ st.subheader("1. Upload reports")
 with st.expander("Full-report extraction options", expanded=False):
     use_ocr = st.checkbox(
         "Use OCR for pages with little or no embedded text",
-        value=True,
+        value=False,
         help="Reads the whole uploaded report. OCR is applied only to pages with little embedded text and may take longer.",
     )
     st.caption("Each ESG dataset row retains its matched statement, nearby context, page number, detected metrics, claim type, and extraction confidence. Tables are extracted alongside page text.")
