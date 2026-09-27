@@ -29,9 +29,13 @@ PILLAR_KEYWORDS = {
 PILLAR_NAMES = {"E": "Environment", "S": "Social", "G": "Governance"}
 NEWS_EVENT_TERMS = TAXONOMY["news_event_terms"]
 NEWS_LOOKBACK_DAYS = 365
-NEWS_SOURCE_WINDOW_DAYS = 90
+NEWS_SOURCE_WINDOW_DAYS = 365
 NEGATIVE_REVIEW_THRESHOLD = 0.70
-MAX_ARTICLE_FETCHES_PER_COMPANY = 20
+NEWS_PILLAR_TARGETS = {"E": 20, "S": 20, "G": 50}
+NEWS_SCORE_WEIGHT = 0.70
+REPORT_SCORE_WEIGHT = 0.30
+MAX_ARTICLE_FETCHES_PER_COMPANY = sum(NEWS_PILLAR_TARGETS.values())
+MAX_ARTICLE_TEXT_FETCHES_PER_COMPANY = 15
 
 # Only these Indian business-news publishers are admitted to the adverse-news
 # candidate set. Reuters and PTI are separate publisher groups; syndication or
@@ -210,61 +214,65 @@ def scan_news_for_company(company: dict, scan_end: date | None = None) -> tuple[
     session = requests.Session()
     session.headers.update({"User-Agent": "IIF-ESG-Research/0.1"})
     for pillar, terms in NEWS_EVENT_TERMS.items():
-        term_block = " OR ".join(f'"{term}"' if " " in term else term for term in terms[:18])
+        target = NEWS_PILLAR_TARGETS.get(pillar, 20)
+        # Narrow term batches improve recall because RSS returns only a small
+        # number of results per query. The target is a search goal, not a
+        # guarantee: publisher access and the search indexes control coverage.
+        batch_size = 10 if target <= 20 else 4
+        term_batches = [terms[i:i + batch_size] for i in range(0, len(terms), batch_size)]
+        before_count = len(articles)
         for entity in entities:
-            params = {
-                "query": f'"{entity}" ({term_block}) ({domain_block}) sourcecountry:IN', "mode": "artlist", "format": "json", "maxrecords": 250,
-                "startdatetime": source_start.strftime("%Y%m%d000000"), "enddatetime": scan_end.strftime("%Y%m%d235959"), "sort": "datedesc",
-            }
-            try:
-                response = session.get("https://api.gdeltproject.org/api/v2/doc/doc", params=params, timeout=25)
-                response.raise_for_status()
-                for item in response.json().get("articles", []):
-                    url, title = item.get("url"), item.get("title", "").strip()
-                    if url and title:
-                        host = (item.get("domain") or urlparse(url).netloc).lower().removeprefix("www.")
-                        publisher = publisher_group(host)
+            for batch in term_batches:
+                term_block = " OR ".join(f'"{term}"' if " " in term else term for term in batch)
+                params = {
+                    "query": f'"{entity}" ({term_block}) ({domain_block}) sourcecountry:IN',
+                    "mode": "artlist", "format": "json", "maxrecords": 250,
+                    "startdatetime": source_start.strftime("%Y%m%d000000"),
+                    "enddatetime": scan_end.strftime("%Y%m%d235959"), "sort": "datedesc",
+                }
+                try:
+                    response = session.get("https://api.gdeltproject.org/api/v2/doc/doc", params=params, timeout=25)
+                    response.raise_for_status()
+                    for item in response.json().get("articles", []):
+                        url, title = item.get("url"), item.get("title", "").strip()
+                        if url and title:
+                            host = (item.get("domain") or urlparse(url).netloc).lower().removeprefix("www.")
+                            publisher = publisher_group(host)
+                            if publisher:
+                                articles.append({"ticker": company["ticker"], "company_name": company.get("company_name", ""), "pillar": pillar, "query_entity": entity,
+                                    "title": title, "url": url, "canonical_url": canonical_url(url), "domain": host, "publisher": publisher,
+                                    "published_at": item.get("seendate", ""), "language": item.get("language", ""), "source_country": item.get("sourcecountry", ""), "discovery_source": "GDELT"})
+                except Exception as exc:
+                    errors.append({"ticker": company["ticker"], "source": "GDELT", "pillar": pillar, "query": entity, "error": f"{type(exc).__name__}: {str(exc)[:250]}"})
+                query = f'"{entity}" ({term_block}) ({site_block}) after:{source_start.isoformat()} before:{(scan_end + timedelta(days=1)).isoformat()}'
+                url = "https://news.google.com/rss/search?" + urlencode({"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"})
+                try:
+                    response = session.get(url, timeout=25)
+                    response.raise_for_status()
+                    root = ET.fromstring(response.content)
+                    for item in root.findall(".//item"):
+                        title, link = item.findtext("title", default="").strip(), item.findtext("link", default="").strip()
+                        if not title or not link:
+                            continue
+                        source = item.find("source")
+                        source_name = source.text.strip() if source is not None and source.text else ""
+                        publisher = publisher_group(source_name) or publisher_group(link)
                         if not publisher:
                             continue
+                        try:
+                            published = parsedate_to_datetime(item.findtext("pubDate", default="")).isoformat()
+                        except Exception:
+                            published = item.findtext("pubDate", default="")
                         articles.append({"ticker": company["ticker"], "company_name": company.get("company_name", ""), "pillar": pillar, "query_entity": entity,
-                            "title": title, "url": url, "canonical_url": canonical_url(url), "domain": host, "publisher": publisher,
-                            "published_at": item.get("seendate", ""), "language": item.get("language", ""), "source_country": item.get("sourcecountry", ""), "discovery_source": "GDELT"})
-            except Exception as exc:
-                errors.append({"ticker": company["ticker"], "source": "GDELT", "pillar": pillar, "query": entity, "error": f"{type(exc).__name__}: {str(exc)[:250]}"})
-            time.sleep(0.15)
-    coverage.append({"ticker": company["ticker"], "source": "GDELT", "requested_start": requested_start.isoformat(), "source_start": source_start.isoformat(), "source_end": scan_end.isoformat(),
-        "coverage_complete": source_start <= requested_start, "coverage_note": "Approved publishers only: Economic Times, Business Standard, Mint, Moneycontrol, Reuters and PTI. Recent article-list window only; older requested dates are not covered"})
-
-    for pillar, terms in NEWS_EVENT_TERMS.items():
-        term_block = " OR ".join(f'"{term}"' if " " in term else term for term in terms[:12])
-        for entity in entities:
-            query = f'"{entity}" ({term_block}) ({site_block}) after:{source_start.isoformat()} before:{(scan_end + timedelta(days=1)).isoformat()}'
-            url = "https://news.google.com/rss/search?" + urlencode({"q": query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"})
-            try:
-                response = session.get(url, timeout=25)
-                response.raise_for_status()
-                root = ET.fromstring(response.content)
-                for item in root.findall(".//item"):
-                    title, link = item.findtext("title", default="").strip(), item.findtext("link", default="").strip()
-                    if not title or not link:
-                        continue
-                    source = item.find("source")
-                    source_name = source.text.strip() if source is not None and source.text else ""
-                    publisher = publisher_group(source_name) or publisher_group(link)
-                    if not publisher:
-                        continue
-                    try:
-                        published = parsedate_to_datetime(item.findtext("pubDate", default="")).isoformat()
-                    except Exception:
-                        published = item.findtext("pubDate", default="")
-                    articles.append({"ticker": company["ticker"], "company_name": company.get("company_name", ""), "pillar": pillar, "query_entity": entity,
-                        "title": title, "url": link, "canonical_url": canonical_url(link), "domain": source_name or urlparse(link).netloc, "publisher": publisher,
-                        "published_at": published, "language": "", "source_country": "India", "discovery_source": "Google News RSS"})
-            except Exception as exc:
-                errors.append({"ticker": company["ticker"], "source": "Google News RSS", "pillar": pillar, "query": entity, "error": f"{type(exc).__name__}: {str(exc)[:250]}"})
-            time.sleep(0.15)
-    coverage.append({"ticker": company["ticker"], "source": "Google News RSS", "requested_start": requested_start.isoformat(), "source_start": source_start.isoformat(), "source_end": scan_end.isoformat(),
-        "coverage_complete": False, "coverage_note": "Best-effort RSS results from approved publishers only; result cap, feed format and historical coverage are not guaranteed"})
+                            "title": title, "url": link, "canonical_url": canonical_url(link), "domain": source_name or urlparse(link).netloc, "publisher": publisher,
+                            "published_at": published, "language": "", "source_country": "India", "discovery_source": "Google News RSS"})
+                except Exception as exc:
+                    errors.append({"ticker": company["ticker"], "source": "Google News RSS", "pillar": pillar, "query": entity, "error": f"{type(exc).__name__}: {str(exc)[:250]}"})
+                time.sleep(0.05)
+        coverage.append({"ticker": company["ticker"], "pillar": pillar, "target_articles": target,
+            "candidates_found": max(0, len(_deduplicate_news(pd.DataFrame(articles[before_count:])))),
+            "source": "GDELT + Google News RSS", "requested_start": requested_start.isoformat(), "source_start": source_start.isoformat(), "source_end": scan_end.isoformat(),
+            "coverage_complete": False, "coverage_note": "Search attempted approved Economic Times, Business Standard, Mint, Moneycontrol, Reuters and PTI publishers in narrow ESG-event query batches. The 365-day window and target count are best-effort, not guaranteed by publisher/search indexes."})
     return _deduplicate_news(pd.DataFrame(articles)), pd.DataFrame(errors), pd.DataFrame(coverage)
 
 
@@ -273,27 +281,30 @@ def classify_news(candidates: pd.DataFrame, classifier) -> pd.DataFrame:
         return candidates.copy()
     result = candidates.copy()
     result["article_text"] = ""
-    result["fetch_status"] = "not fetched: per-company prototype cap"
+    result["fetch_status"] = "headline only: article-text retrieval budget reached"
     try:
         import trafilatura
     except ImportError:
         trafilatura = None
-    for _, group in result.groupby("ticker"):
-        for idx in list(group.index[:MAX_ARTICLE_FETCHES_PER_COMPANY]):
-            if trafilatura is None:
-                result.loc[idx, "fetch_status"] = "trafilatura is not installed"
-                continue
-            try:
-                downloaded = trafilatura.fetch_url(result.loc[idx, "url"])
-                body = trafilatura.extract(downloaded, include_comments=False, include_tables=False, favor_recall=True) if downloaded else ""
-                if body:
-                    result.loc[idx, "article_text"] = body[:10000]
-                    result.loc[idx, "fetch_status"] = "article text retrieved"
-                else:
-                    result.loc[idx, "fetch_status"] = "publisher article unavailable; headline used"
-            except Exception as exc:
-                result.loc[idx, "fetch_status"] = f"fetch failed: {type(exc).__name__}"
-            time.sleep(0.1)
+    for ticker, group in result.groupby("ticker"):
+        for pillar, pillar_group in group.groupby("pillar"):
+            limit = min(NEWS_PILLAR_TARGETS.get(str(pillar), 20), MAX_ARTICLE_TEXT_FETCHES_PER_COMPANY // len(NEWS_PILLAR_TARGETS))
+            ordered = pillar_group.sort_values("published_at", ascending=False, kind="stable")
+            for idx in list(ordered.index[:limit]):
+                if trafilatura is None:
+                    result.loc[idx, "fetch_status"] = "trafilatura is not installed"
+                    continue
+                try:
+                    downloaded = trafilatura.fetch_url(result.loc[idx, "url"])
+                    body = trafilatura.extract(downloaded, include_comments=False, include_tables=False, favor_recall=True) if downloaded else ""
+                    if body:
+                        result.loc[idx, "article_text"] = body[:10000]
+                        result.loc[idx, "fetch_status"] = "article text retrieved"
+                    else:
+                        result.loc[idx, "fetch_status"] = "publisher article unavailable; headline used"
+                except Exception as exc:
+                    result.loc[idx, "fetch_status"] = f"fetch failed: {type(exc).__name__}"
+                time.sleep(0.1)
     result["model_input_source"] = result["article_text"].map(lambda text: "article text" if text else "headline only")
     detected = []
     from langdetect import detect, LangDetectException
@@ -353,15 +364,54 @@ def apply_incidents_and_rank(document_scores: pd.DataFrame, incidents: pd.DataFr
             penalties[key] += severity
     detail = document_scores.copy()
     detail["approved_incident_penalty"] = [penalties[(r.ticker, r.pillar)] for r in detail.itertuples()]
-    detail["provisional_score_0_7"] = (detail["document_evidence_score_0_7"] - detail["approved_incident_penalty"]).clip(lower=0).round(2)
-    if not news.empty and "finbert_negative_probability" in news:
-        neg = news[news["finbert_negative_probability"] >= NEGATIVE_REVIEW_THRESHOLD].groupby("ticker").size()
+    if not news.empty and {"ticker", "pillar"}.issubset(news.columns):
+        coverage_counts = news.groupby(["ticker", "pillar"]).size().to_dict()
     else:
-        neg = pd.Series(dtype="int64")
-    detail["negative_news_candidates"] = detail["ticker"].map(neg).fillna(0).astype(int)
+        coverage_counts = {}
+    detail["news_articles_found"] = [int(coverage_counts.get((r.ticker, r.pillar), 0)) for r in detail.itertuples()]
+    detail["news_article_target"] = detail["pillar"].map(NEWS_PILLAR_TARGETS).fillna(20).astype(int)
+    detail["news_target_met"] = detail["news_articles_found"] >= detail["news_article_target"]
+    # FinBERT sentiment contributes to the news-heavy provisional score, but
+    # incomplete coverage or missing model outputs are neutral, never clean.
+    if not news.empty and {"ticker", "pillar", "finbert_negative_probability"}.issubset(news.columns):
+        probabilities = pd.to_numeric(news["finbert_negative_probability"], errors="coerce")
+        usable_news = news.loc[probabilities.notna(), ["ticker", "pillar"]].copy()
+        usable_news["negative_probability"] = probabilities[probabilities.notna()]
+        mean_negative = usable_news.groupby(["ticker", "pillar"])["negative_probability"].mean().to_dict()
+    else:
+        mean_negative = {}
+    detail["news_average_negative_probability"] = [mean_negative.get((r.ticker, r.pillar), float("nan")) for r in detail.itertuples()]
+    detail["news_component_basis"] = [
+        "FinBERT mean negative probability" if bool(row.news_target_met) and pd.notna(row.news_average_negative_probability)
+        else "neutral: article target or model coverage shortfall"
+        for row in detail.itertuples()
+    ]
+    news_baseline = [
+        7.0 * (1.0 - float(row.news_average_negative_probability))
+        if bool(row.news_target_met) and pd.notna(row.news_average_negative_probability)
+        else 3.5
+        for row in detail.itertuples()
+    ]
+    # Analyst-confirmed incident severity is a minimum penalty. Taking the
+    # lower score avoids counting the same event twice on top of sentiment.
+    detail["news_risk_score_0_7"] = [
+        round(max(0.0, min(base, 7.0 - penalty)), 2)
+        for base, penalty in zip(news_baseline, detail["approved_incident_penalty"])
+    ]
+    detail["report_weighted_component"] = (detail["document_evidence_score_0_7"] * REPORT_SCORE_WEIGHT).round(2)
+    detail["news_weighted_component"] = (detail["news_risk_score_0_7"] * NEWS_SCORE_WEIGHT).round(2)
+    detail["provisional_score_0_7"] = (detail["report_weighted_component"] + detail["news_weighted_component"]).round(2)
+    if not news.empty and {"ticker", "pillar"}.issubset(news.columns):
+        neg = news[news.get("finbert_negative_probability", pd.Series(index=news.index, dtype=float)) >= NEGATIVE_REVIEW_THRESHOLD].groupby(["ticker", "pillar"]).size().to_dict() if "finbert_negative_probability" in news else {}
+    else:
+        neg = {}
+    detail["negative_news_candidates"] = [int(neg.get((r.ticker, r.pillar), 0)) for r in detail.itertuples()]
     ranking = detail.groupby(["ticker", "company_name"], as_index=False).agg(
         overall_score_0_21=("provisional_score_0_7", "sum"),
-        negative_news_candidates=("negative_news_candidates", "max"),
+        negative_news_candidates=("negative_news_candidates", "sum"),
+        news_articles_found=("news_articles_found", "sum"),
+        news_article_targets=("news_article_target", "sum"),
+        news_targets_met=("news_target_met", "all"),
     )
     ranking["overall_score_0_21"] = ranking["overall_score_0_21"].round(2)
     ranking["esg_rank"] = ranking["overall_score_0_21"].rank(method="min", ascending=False).astype(int)

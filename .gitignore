@@ -2,3 +2,6 @@ __pycache__/
 .ipynb_checkpoints/
 outputs/*.csv
 *.pdf
+data/*.sqlite3
+data/*.sqlite3-wal
+data/*.sqlite3-shm

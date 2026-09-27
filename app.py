@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 import tempfile
+import uuid
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -30,8 +32,12 @@ apply_incidents_and_rank = _engine.apply_incidents_and_rank
 calculate_document_scores = _engine.calculate_document_scores
 classify_news = _engine.classify_news
 scan_news_for_company = _engine.scan_news_for_company
+NEWS_PILLAR_TARGETS = _engine.NEWS_PILLAR_TARGETS
+NEWS_SCORE_WEIGHT = _engine.NEWS_SCORE_WEIGHT
+REPORT_SCORE_WEIGHT = _engine.REPORT_SCORE_WEIGHT
 
 from config import DEFAULTS
+from esg.database import database_bytes, database_summary, read_table, save_evidence_batch, save_score_batch
 from esg.exporter import export_results
 from esg.keyword_matcher import KeywordMatcher
 from esg.pipeline import process_pdf_bytes
@@ -57,11 +63,23 @@ def dataset_downloads(records: list[dict], errors: list[dict]) -> dict[str, byte
         return {name: path.read_bytes() for name, path in paths.items()}
 
 
+def session_database_path():
+    """Keep each browser session's evidence store isolated from other users."""
+    key = "iif_esg_database_path"
+    if key not in st.session_state:
+        session_folder = tempfile.mkdtemp(prefix="iif_esg_session_")
+        st.session_state[key] = str(Path(session_folder) / "iif_esg_database.sqlite3")
+    return st.session_state[key]
+
+
+DB_PATH = session_database_path()
+
+
 st.title("IIF ESG Parameterization Framework")
 st.caption("Upload complete annual reports without cropping pages, review topic evidence and adverse-news candidates, then compare provisional company scores.")
 
 with st.expander("How this prototype scores companies", expanded=False):
-    st.write("Each E, S and G score runs from 0 to 7 and measures evidence found in the uploaded report. The overall ranking is out of 21. Negative news is surfaced for analyst review and does not reduce a score automatically. The news scan admits only The Economic Times, Business Standard, Mint, Moneycontrol, Reuters and PTI.")
+    st.write("Each E, S and G score runs from 0 to 7. The provisional pillar score weights news at 70% and annual-report evidence at 30%. The news targets are 20 Environmental, 20 Social and 50 Governance articles per company. FinBERT negative probabilities affect the provisional news component when coverage targets are met; a shortfall receives a neutral component, not a clean-news score. Sentiment is a review signal, not proof. Analyst-confirmed incidents can impose a severity penalty. The overall ranking is out of 21. The scan admits only The Economic Times, Business Standard, Mint, Moneycontrol, Reuters and PTI.")
     st.write("To confirm a news-reported incident, enter direct article URLs from five distinct approved publishers. Count each publisher once and exclude syndicated or repeated copies of the same report. The only one-document exception is an HTTPS link on a .gov.in, .nic.in or rbi.org.in domain to a final regulator order or sanction, final court judgment, or final statutory authority decision. Preliminary notices, allegations, company statements and ordinary filings do not qualify as final findings.")
     st.warning(TAXONOMY.get("note", "Review the topic dictionaries before relying on comparisons."))
 
@@ -111,7 +129,7 @@ mapping = st.data_editor(
 
 with st.expander("News scan options", expanded=False):
     run_news = st.checkbox("Search GDELT and Google News RSS, then classify English candidates with FinBERT", value=True)
-    st.caption("News search is best-effort and currently covers a recent window of up to 90 days. It is not a complete 12-month archive. FinBERT model files download the first time the scan runs.")
+    st.caption("Per-company search targets: 20 Environmental, 20 Social and 50 Governance articles. Search indexes and publisher access can return fewer; the results show counts and shortfalls. Queries request up to 365 days, but historical coverage is not guaranteed. FinBERT model files download the first time the scan runs.")
 
 run = st.button("Analyse reports and rank companies", type="primary", use_container_width=True)
 if run:
@@ -139,6 +157,7 @@ if run:
 
     evidence_frames, page_rows, error_rows, coverage_frames, news_frames = [], [], [], [], []
     dataset_records, dataset_errors = [], []
+    run_id = uuid.uuid4().hex
     esg_matcher = load_esg_matcher()
     status = st.status("Processing uploaded reports and news…", expanded=True)
     for company in companies:
@@ -204,7 +223,9 @@ if run:
             news["finbert_negative_probability"] = float("nan")
             news["needs_analyst_review"] = True
     document_scores = calculate_document_scores(evidence, successful_companies)
+    save_evidence_batch(run_id, news, evidence, dataset_records, DB_PATH)
     st.session_state["iif_esg_analysis"] = {
+        "run_id": run_id,
         "companies": successful_companies,
         "evidence": evidence,
         "document_scores": document_scores,
@@ -226,7 +247,7 @@ if analysis:
         st.markdown("**News source coverage**")
         st.dataframe(analysis["coverage"], hide_index=True, use_container_width=True)
     if not analysis["news"].empty:
-        display_columns = [col for col in ["ticker", "pillar", "title", "publisher", "domain", "published_at", "discovery_source", "detected_language", "finbert_label", "finbert_negative_probability", "needs_analyst_review", "url"] if col in analysis["news"].columns]
+        display_columns = [col for col in ["ticker", "pillar", "title", "publisher", "domain", "published_at", "discovery_source", "detected_language", "fetch_status", "model_input_source", "finbert_label", "finbert_negative_probability", "needs_analyst_review", "url"] if col in analysis["news"].columns]
         st.dataframe(analysis["news"][display_columns].sort_values(["ticker", "finbert_negative_probability"], ascending=[True, False], na_position="last"), hide_index=True, use_container_width=True)
     elif run_news:
         st.info("No news candidates returned. Review the coverage and query errors before interpreting this as no adverse news.")
@@ -265,12 +286,13 @@ if analysis:
         populated = populated[populated["analyst_confirmed"].fillna(False).astype(bool)]
     try:
         rankings, pillar_detail = apply_incidents_and_rank(analysis["document_scores"], populated, analysis["news"])
+        save_score_batch(analysis["run_id"], rankings, pillar_detail, incidents=populated, path=DB_PATH)
         st.subheader("4. Company ranking")
         st.dataframe(rankings, hide_index=True, use_container_width=True)
         st.bar_chart(rankings.set_index("ticker")["overall_score_0_21"], y_label="Provisional score out of 21")
         st.markdown("**Pillar score detail**")
         st.dataframe(pillar_detail, hide_index=True, use_container_width=True)
-        st.caption("Higher scores reflect more report evidence under this prototype. They do not establish better ESG outcomes.")
+        st.caption("Score formula: 70% FinBERT news signal and 30% annual-report evidence. A pillar below its article target receives a neutral news component and is flagged; it is not treated as having no controversy. FinBERT sentiment is provisional and never proves an incident. Analyst-confirmed incidents that satisfy the source corroboration rule can impose a severity penalty without double-counting the same sentiment.")
         st.download_button("Download company ranking CSV", rankings.to_csv(index=False).encode("utf-8-sig"), "iif_esg_company_ranking.csv", "text/csv")
         st.download_button("Download pillar score detail CSV", pillar_detail.to_csv(index=False).encode("utf-8-sig"), "iif_esg_pillar_scores.csv", "text/csv")
     except Exception as exc:
@@ -307,6 +329,22 @@ if analysis:
         st.download_button("Download ESG dataset JSON", downloads["json"], "iif_esg_backend_dataset.json", "application/json")
     if not analysis["news"].empty:
         st.download_button("Download news candidates CSV", analysis["news"].to_csv(index=False).encode("utf-8-sig"), "iif_esg_news_candidates.csv", "text/csv")
+
+    st.subheader("6. ESG evidence database")
+    db_summary = database_summary(DB_PATH)
+    count_cols = st.columns(5)
+    count_labels = [("news_articles", "News articles"), ("report_evidence", "Report evidence rows"), ("esg_dataset", "ESG dataset rows"), ("score_history", "Stored pillar scores"), ("analyst_incidents", "Confirmed incidents")]
+    for col, (key, label) in zip(count_cols, count_labels):
+        col.metric(label, db_summary["counts"][key])
+    st.caption("This browser session has its own isolated SQLite database for deduplicated news, report evidence, ESG dataset rows, analyst-confirmed incidents, and score history. Other users cannot see this session's database. Download it for durable storage or backup; session files can be removed when Streamlit Cloud restarts or the session expires.")
+    database_view = st.selectbox("Database table", ["News articles", "Report evidence", "ESG dataset", "Score history", "Analyst-confirmed incidents"], key="database_table_view")
+    table_names = {"News articles": "news_articles", "Report evidence": "report_evidence", "ESG dataset": "esg_dataset", "Score history": "score_history", "Analyst-confirmed incidents": "analyst_incidents"}
+    stored_rows = read_table(table_names[database_view], DB_PATH)
+    if not stored_rows.empty:
+        st.dataframe(stored_rows, hide_index=True, use_container_width=True)
+    else:
+        st.info("This database table is empty until a report analysis is saved.")
+    st.download_button("Download SQLite ESG database", database_bytes(DB_PATH), "iif_esg_database.sqlite3", "application/vnd.sqlite3")
 
 st.divider()
 st.caption("Prototype for analyst review. The report extractor uses 25 Environmental, 17 Social, and 40 Governance topics. Scores remain provisional evidence-coverage measures, not verified ESG performance. Uploaded reports are processed by this app; avoid uploading confidential documents to any hosted service unless your organisation has approved that use.")
