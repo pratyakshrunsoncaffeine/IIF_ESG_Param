@@ -13,7 +13,6 @@ COLUMNS = [
     ("Matched Keywords", "matched_keywords"), ("Primary Keyword", "keyword"),
     ("Claim Type", "claim_type"), ("Extracted Statement", "matched_sentence"),
     ("Context Before", "context_before"), ("Context After", "context_after"),
-    ("Raw Text", "raw_text"), ("Cleaned Text", "cleaned_text"),
     ("Value", "value"), ("Unit", "unit"), ("Reporting Period", "reporting_period"),
     ("Previous Value", "previous_value"), ("Previous Period", "previous_period"),
     ("Current Value", "current_value"), ("Current Period", "current_period"),

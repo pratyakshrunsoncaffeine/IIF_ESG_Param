@@ -47,7 +47,9 @@ def _base(page: dict, pillar: str, topic: str, words: list[str], statement: str,
             "keyword": primary, "matched_keywords": words,
             "claim_type": classify(statement, metrics), "matched_sentence": statement,
             "context_before": before, "context_after": after,
-            "raw_text": page["raw_text"], "cleaned_text": page["cleaned_text"],
+            # Keep evidence snippets rather than copying the full page into
+            # every keyword match. Large annual reports otherwise multiply
+            # page text across thousands of rows and can exhaust Cloud memory.
             **metrics, "ocr_used": page["ocr_used"], "table_index": None,
             "table_row": None, "column_headers": None, "raw_table_data": None,
             "confidence": confidence(words, statement, metrics, ocr=page["ocr_used"])}
