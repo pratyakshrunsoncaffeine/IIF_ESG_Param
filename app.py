@@ -169,7 +169,7 @@ if analysis:
             st.dataframe(analysis["errors"], hide_index=True, use_container_width=True)
 
     st.subheader("3. Record analyst-confirmed incidents")
-    st.caption("Enter one row per underlying event, not per article. Paste one direct article URL per line in Source URLs. The app counts distinct approved publisher groups and applies one rule: five of six listed publishers, or an HTTPS URL on a .gov.in, .nic.in or rbi.org.in domain to a final regulator order or sanction, final court judgment, or final statutory authority decision.")
+    st.caption("Enter one row per underlying event, not per article. Separate direct article URLs with semicolons in Source URLs. The app counts distinct approved publisher groups and applies one rule: five of six listed publishers, or an HTTPS URL on a .gov.in, .nic.in or rbi.org.in domain to a final regulator order or sanction, final court judgment, or final statutory authority decision.")
     incident_columns = ["ticker", "pillar", "severity_points", "status", "source_urls", "official_record_url", "summary", "already_in_metric", "analyst_confirmed"]
     incident_defaults = pd.DataFrame(columns=incident_columns)
     if "iif_esg_incidents" not in st.session_state:
@@ -185,7 +185,7 @@ if analysis:
             "pillar": st.column_config.SelectboxColumn(options=["E", "S", "G"], required=True),
             "severity_points": st.column_config.SelectboxColumn(options=[0.5, 1.0, 2.0]),
             "status": st.column_config.SelectboxColumn(options=["news reports", "final regulator order or sanction", "final court judgment", "final statutory authority decision"], required=True),
-            "source_urls": st.column_config.TextColumn(help="One direct article URL per line. Only the approved six publisher groups count, and each group counts once."),
+            "source_urls": st.column_config.TextColumn(help="Separate direct article URLs with semicolons. Only the approved six publisher groups count, and each group counts once."),
             "official_record_url": st.column_config.TextColumn(help="Link directly to the final official decision document. Required for the one-document exception."),
             "summary": st.column_config.TextColumn(),
             "already_in_metric": st.column_config.CheckboxColumn(),
