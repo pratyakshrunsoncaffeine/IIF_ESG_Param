@@ -5,8 +5,6 @@ import csv
 import json
 from collections import defaultdict
 from pathlib import Path
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
 
 COLUMNS = [
     ("Ticker", "ticker"), ("Company", "company"), ("Source File", "source_file"),
@@ -34,7 +32,9 @@ def _cell(record: dict, key: str):
     return "; ".join(value) if isinstance(value, list) else value
 
 
-def _sheet(workbook: Workbook, title: str, headers: list[str], rows: list[list]):
+def _sheet(workbook, title: str, headers: list[str], rows: list[list]):
+    from openpyxl.styles import Font, PatternFill
+
     ws = workbook.create_sheet(title)
     ws.append(headers)
     for row in rows:
@@ -67,6 +67,13 @@ def export_results(records: list[dict], errors: list[dict], output_dir: str | Pa
         writer = csv.DictWriter(f, fieldnames=ERROR_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(errors)
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        # Keep CSV/JSON exports and the app usable if Streamlit is still
+        # resolving optional workbook dependencies during a deployment.
+        return {"csv": csv_path, "json": json_path, "errors": error_path}
+
     wb = Workbook()
     wb.remove(wb.active)
     headers = [h for h, _ in COLUMNS]
