@@ -13,13 +13,18 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import pandas as pd
 import requests
 import pymupdf
+from esg.dictionary_loader import load_dictionary
 
 ROOT = Path(__file__).resolve().parent
 TAXONOMY = json.loads((ROOT / "esg_taxonomy.json").read_text(encoding="utf-8"))
+ESG_DICTIONARY = load_dictionary(ROOT / "data" / "normalized_dictionary.json")
+TAXONOMY["environment_keywords"] = ESG_DICTIONARY["Environmental"]
+TAXONOMY["social_keywords"] = ESG_DICTIONARY["Social"]
+TAXONOMY["governance_keywords"] = ESG_DICTIONARY["Governance"]
 PILLAR_KEYWORDS = {
-    "E": TAXONOMY["environment_keywords"],
-    "S": TAXONOMY["social_keywords"],
-    "G": TAXONOMY["governance_keywords"],
+    "E": ESG_DICTIONARY["Environmental"],
+    "S": ESG_DICTIONARY["Social"],
+    "G": ESG_DICTIONARY["Governance"],
 }
 PILLAR_NAMES = {"E": "Environment", "S": "Social", "G": "Governance"}
 NEWS_EVENT_TERMS = TAXONOMY["news_event_terms"]

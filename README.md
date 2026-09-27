@@ -9,7 +9,15 @@ A Streamlit app and Jupyter Notebook prototype for reviewing ESG evidence across
 3. Install Tesseract OCR and make it available on your system path for scanned reports.
 4. Start the app from this folder with `streamlit run app.py`.
 5. Upload PDFs, enter one exchange-qualified ticker per file, and select **Analyse reports and rank companies**.
-6. Review news and report evidence. Only analyst-confirmed incidents that satisfy the corroboration rule can lower scores.
+6. Review the extracted ESG dataset, news and report evidence. Only analyst-confirmed incidents that satisfy the corroboration rule can lower scores.
+
+## Full-report ESG dataset
+
+Upload complete annual, sustainability, ESG, BRSR or governance PDFs. The app processes each page and its tables without requiring users to crop pages. OCR is enabled by default for pages with little embedded text and can be turned off in the extraction options. Tesseract OCR is installed in Streamlit Cloud through `packages.txt`.
+
+The extractor matches the complete supplied dictionary of **25 Environmental, 17 Social and 40 Governance topics**. It exports a backend dataset with one row per matched statement and topic, including the source file and page, neighboring context, matched terms, claim type, quantities, units, reporting periods, targets, trends, table data, OCR status and an evidence confidence hint. Download the dataset as Excel, CSV or JSON. The Excel workbook includes pillar sheets, a topic summary and extraction errors.
+
+Confidence is a rule-based evidence-quality hint, not a calibrated probability or ESG score. The dataset supports analyst review; it does not prove a company claim or validate a reported outcome. See [`ESG_DATASET_README.md`](ESG_DATASET_README.md) for the extractor field definitions and limitations.
 
 The notebook prototype is available as `ESG_company_screener.ipynb`.
 
@@ -27,6 +35,6 @@ GDELT and the India edition of Google News RSS are discovery sources, restricted
 
 ## Limitations
 
-The supplied Environmental and Governance keyword attachments were truncated. Complete and validate those dictionaries before comparing companies. Equal topic weights can mis-rank companies across sectors. Validate the framework against manually reviewed reports and news before using its rankings for investment decisions.
+Equal topic weights can mis-rank companies across sectors. Validate the complete dictionaries, extraction quality, and scoring thresholds against manually reviewed reports and news before using rankings for investment decisions. OCR and complex table extraction can be imperfect; check extracted values against the cited page.
 
 Uploaded PDFs are processed by the hosted app and should not be uploaded unless the hosting and data handling have been approved by the IIF. The app does not commit uploaded PDFs or results to the repository. Generated evidence and score data are available to download as CSV during the session.
