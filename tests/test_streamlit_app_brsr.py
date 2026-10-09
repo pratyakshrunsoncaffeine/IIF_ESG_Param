@@ -99,3 +99,43 @@ def test_apptest_groups_optional_brsr_with_one_ticker_across_multiple_companies(
     assert set(analysis["dataset"].query("ticker == 'AAA.NS'")["document_type"]) == {"annual_report", "brsr"}
     assert set(analysis["dataset"].query("ticker == 'AAA.NS'")["source_file"]) == {"alpha-annual.pdf", "alpha-brsr.pdf"}
     assert set(analysis["dataset"].query("ticker == 'BBB.NS'")["document_type"]) == {"annual_report"}
+
+
+def test_apptest_news_fallback_reaches_ranking_and_downloads(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    import pandas as pd
+    import esg_engine
+
+    tokenizer = SimpleNamespace(model_max_length=512, encode=lambda text, **_: text.split(),
+                                decode=lambda tokens, **_: " ".join(tokens))
+
+    class Classifier:
+        def __call__(self, texts, **kwargs):
+            return [[{"label": "negative", "score": .8}, {"label": "neutral", "score": .15},
+                     {"label": "positive", "score": .05}]]
+
+    classifier = Classifier()
+    classifier.tokenizer = tokenizer
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(set_num_threads=lambda _: None, get_num_threads=lambda: 2))
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(pipeline=lambda *_, **__: classifier))
+    monkeypatch.setitem(sys.modules, "langdetect", SimpleNamespace(detect=lambda _: "en"))
+    rows = pd.DataFrame([{"ticker": "HDFCBANK.NS", "company_name": "HDFC Bank", "pillar": "G",
+                          "title": f"RBI fined HDFC Bank for regulatory breach case {i}", "publisher": "Mint",
+                          "url": f"https://livemint.com/story/{i}"} for i in range(58)])
+    monkeypatch.setattr(esg_engine, "scan_news_for_company", lambda *_, **__: (rows, pd.DataFrame(), pd.DataFrame()))
+    monkeypatch.setattr(esg_engine, "retrieve_full_article", lambda url, _: {
+        "url": url, "article_text": "", "retrieval_state": "blocked", "retrieval_reason": "HTTP 403"})
+    at = AppTest.from_file(APP_PATH).run(timeout=30)
+    at.get("file_uploader")[0].upload("annual.pdf", b"mock annual PDF", "application/pdf").run(timeout=30)
+    mapping = {"annual": [{"Ticker": "HDFCBANK.NS", "Company name": "HDFC Bank"}], "brsr": []}
+    _submit(at, mapping)
+    assert not at.exception
+    news = at.session_state["iif_esg_analysis"]["news"]
+    assert news["headline_scored"].all() and news["scoring_eligible"].all()
+    ranking = next(item.value for item in at.dataframe if "negative_news_penalty" in item.value.columns
+                   and "overall_score_0_21" in item.value.columns and "pillar" not in item.value.columns)
+    assert ranking.iloc[0]["negative_news_penalty"] == 2
+    assert ranking.iloc[0]["weighted_negative_news_candidates"] == 29
+    assert ranking.iloc[0]["headline_only_scored_count"] == 58
+    assert any(item.value == "4. Company ranking" for item in at.subheader)

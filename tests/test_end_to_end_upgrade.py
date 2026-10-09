@@ -258,7 +258,7 @@ def test_unrelated_market_candidate_cannot_change_coverage_score_or_penalty(monk
     assert with_unrelated.iloc[0]["overall_score_0_21"] == without_unrelated.iloc[0]["overall_score_0_21"]
 
 
-def test_retrieval_and_partial_classifier_failures_never_create_scored_news(monkeypatch):
+def test_unsupported_headline_and_partial_classifier_failure_stay_unscored(monkeypatch):
     monkeypatch.setitem(sys.modules, "langdetect", SimpleNamespace(detect=lambda _text: "en"))
     candidates, market, valid = _news_rows()
 
@@ -269,7 +269,7 @@ def test_retrieval_and_partial_classifier_failures_never_create_scored_news(monk
     assert unavailable.iloc[0]["retrieval_state"] == "failed"
     assert not unavailable.iloc[0]["scoring_eligible"]
     assert pd.isna(unavailable.iloc[0]["finbert_negative_probability"])
-    assert unavailable.iloc[0]["model_input_source"] == "none: no headline fallback"
+    assert unavailable.iloc[0]["model_input_source"] == "headline only"
 
     broken_model = _FakeClassifier(fail_on_call=2)
     failed_score = esg_engine.classify_news(

@@ -36,6 +36,7 @@ NEWS_PILLAR_TARGETS = {"E": 20, "S": 20, "G": 50}
 NEWS_SCORE_WEIGHT = 0.70
 REPORT_SCORE_WEIGHT = 0.30
 NEGATIVE_NEWS_PENALTY_PER_7 = 0.5
+HEADLINE_NEGATIVE_WEIGHT = 0.5
 
 # Only these Indian business-news publishers are admitted to the adverse-news
 # candidate set. Reuters and PTI are separate publisher groups; syndication or
@@ -307,10 +308,12 @@ def classify_news(candidates: pd.DataFrame, classifier, article_fetcher=None, pr
         "publication_window_valid": False, "publication_window_reason": "Publication window has not been checked",
         "chunk_count": 0, "chunks_scored": 0, "token_count": 0, "full_text_scored": False,
         "scoring_error": "", "duplicate_of": "",
+        "headline_scored": False, "scoring_text": "", "negative_evidence_weight": 0.0,
+        "effective_negative_probability": float("nan"),
     }
     for column, value in defaults.items():
         result[column] = value
-    result["model_input_source"] = "none: no headline fallback"
+    result["model_input_source"] = "none"
     result["fetch_status"] = "retrieval pending"
     total = len(result)
     domains_for = dict(APPROVED_NEWS_PUBLISHERS)
@@ -353,12 +356,15 @@ def classify_news(candidates: pd.DataFrame, classifier, article_fetcher=None, pr
         result.at[idx, "google_news_resolution"] = str(retrieval.get("google_news_resolution", ""))
         result.at[idx, "full_article_available"] = available
         result.at[idx, "fetch_status"] = reason
-        result.at[idx, "model_input_source"] = "full article" if available else "none: no headline fallback"
+        headline = _headline_text(row.get("title", ""))
+        scoring_text = body if available else headline
+        result.at[idx, "model_input_source"] = "full article" if available else "headline only"
+        result.at[idx, "scoring_text"] = scoring_text
         progress("retrieval_complete", ticker=row.get("ticker", ""), processed=processed,
                  retrieval_state=state, full_article_available=available)
-        if not available:
+        if not available and (not _news_source_allowed(dict(row, url=direct_url)) or state == "rejected_redirect" or len(headline.split()) < 4):
             result.at[idx, "relevance_decision"] = "not evaluated"
-            result.at[idx, "relevance_reason"] = "Full article retrieval did not produce a usable body"
+            result.at[idx, "relevance_reason"] = "No usable headline from an approved publisher is available for fallback"
             continue
 
         window_start, window_end = row.get("source_start"), row.get("source_end")
@@ -389,9 +395,10 @@ def classify_news(candidates: pd.DataFrame, classifier, article_fetcher=None, pr
         queried = str(row.get("queried_pillars", row.get("pillar", ""))).split(",")
         queried_pillar = next((value.strip() for value in queried if value.strip() in PILLAR_NAMES), "")
         relevant, decision, relevance_reason, material_pillar, attribution_evidence = relevance_and_pillar(
-            body, company, str(row.get("ticker", "")), queried_pillar, NEWS_EVENT_TERMS,
+            scoring_text, company, str(row.get("ticker", "")), queried_pillar, NEWS_EVENT_TERMS,
         )
         result.at[idx, "relevance_decision"] = decision
+        relevance_reason = relevance_reason.replace("article", "headline") if not available else relevance_reason
         result.at[idx, "relevance_reason"] = relevance_reason
         result.at[idx, "attribution_evidence"] = attribution_evidence
         if not relevant:
@@ -399,50 +406,96 @@ def classify_news(candidates: pd.DataFrame, classifier, article_fetcher=None, pr
         result.at[idx, "pillar"] = material_pillar
         try:
             from langdetect import detect
-            language = detect(body[:10000])
+            language = detect(scoring_text[:10000])
         except Exception:
             language = "unknown"
         result.at[idx, "detected_language"] = language
         if language != "en":
-            result.at[idx, "relevance_reason"] = f"{relevance_reason}; full article language is {language}, and FinBERT scoring is English-only"
+            result.at[idx, "relevance_reason"] = f"{relevance_reason}; text language is {language}, and FinBERT scoring is English-only"
             continue
         scored = score_whole_article(
-            body, classifier,
+            scoring_text, classifier,
             progress_callback=lambda event_details: progress(
                 "chunk_scored", ticker=row.get("ticker", ""), processed=processed, **event_details,
             ),
         )
         for column, value in scored.items():
             result.at[idx, column] = value
+        successfully_scored = bool(scored.get("full_text_scored") and scored.get("chunk_count", 0) > 0 and scored.get("chunks_scored") == scored.get("chunk_count"))
+        result.at[idx, "full_text_scored"] = successfully_scored and available
+        result.at[idx, "headline_scored"] = successfully_scored and not available
+        weight = (1.0 if available else HEADLINE_NEGATIVE_WEIGHT) if successfully_scored else 0.0
+        result.at[idx, "negative_evidence_weight"] = weight
+        if successfully_scored:
+            result.at[idx, "effective_negative_probability"] = float(scored["finbert_negative_probability"]) * weight
         result.at[idx, "needs_analyst_review"] = bool(
-            scored.get("full_text_scored") and scored.get("finbert_negative_probability", 0.0) >= NEGATIVE_REVIEW_THRESHOLD
+            successfully_scored and scored.get("finbert_negative_probability", 0.0) >= NEGATIVE_REVIEW_THRESHOLD
         )
-        eligible = bool(scored.get("full_text_scored") and scored.get("chunks_scored") == scored.get("chunk_count") and publisher_group(direct_url) == publisher)
+        eligible = successfully_scored and _news_source_allowed(dict(row, url=direct_url))
         result.at[idx, "scoring_eligible"] = eligible
         if not eligible and scored.get("scoring_error"):
-            result.at[idx, "relevance_reason"] = f"{relevance_reason}; full-text scoring failed: {scored['scoring_error']}"
+            result.at[idx, "relevance_reason"] = f"{relevance_reason}; scoring failed: {scored['scoring_error']}"
         progress("article_scored", ticker=row.get("ticker", ""), processed=processed,
                  chunk_count=scored.get("chunk_count", 0), chunks_scored=scored.get("chunks_scored", 0),
-                 full_text_scored=scored.get("full_text_scored", False), scoring_eligible=eligible)
+                 full_text_scored=successfully_scored and available,
+                 headline_scored=successfully_scored and not available, scoring_eligible=eligible)
 
-    # Syndicated copies can arrive from multiple approved publishers. Keep all
-    # records for audit, but only the first full-text copy can enter scoring.
-    processed_bodies = []
-    for idx in result.index[result["scoring_eligible"]].tolist():
-        ticker = str(result.at[idx, "ticker"])
-        body = str(result.at[idx, "article_text"])
-        duplicate = next((prior for prior in processed_bodies if prior[0] == ticker and bodies_near_duplicate(prior[2], body)), None)
-        if duplicate:
+    # Prefer complete bodies over matching headline-only copies, regardless of
+    # discovery order. Preserve every rejected duplicate in the audit.
+    eligible_rows = result.loc[result["scoring_eligible"]]
+    kept = _deduplicate_scored_news(eligible_rows)
+    for idx in eligible_rows.index:
+        if idx not in kept.index:
             result.at[idx, "scoring_eligible"] = False
-            result.at[idx, "duplicate_of"] = duplicate[1]
-            result.at[idx, "relevance_reason"] = "Syndicated or near-identical full article already counted from " + duplicate[1]
-        else:
-            processed_bodies.append((ticker, str(result.at[idx, "url"]), body))
+            prior = next(prior for _, prior in kept.iterrows() if _same_news_story(result.loc[idx], prior))
+            result.at[idx, "duplicate_of"] = prior["url"]
+            result.at[idx, "relevance_reason"] = "Duplicate story already counted from " + str(prior["url"])
     return result
 
 
+def _headline_text(value) -> str:
+    text = str(value or "").strip()
+    # Google RSS adds an outlet suffix which is not part of the headline.
+    parts = text.rsplit(" - ", 1)
+    return parts[0].strip() if len(parts) == 2 and publisher_group(parts[1]) else text
+
+
+def _news_source_allowed(row) -> bool:
+    publisher = str(row.get("publisher", ""))
+    direct = publisher_group(str(row.get("url", "")))
+    if direct:
+        return direct in APPROVED_NEWS_PUBLISHERS and (not publisher or publisher == direct)
+    parsed = urlparse(str(row.get("url", "")))
+    return bool(parsed.scheme == "https" and parsed.netloc == "news.google.com"
+                and parsed.path.startswith(("/rss/articles/", "/articles/"))
+                and row.get("discovery_source") == "Google News RSS"
+                and publisher in APPROVED_NEWS_PUBLISHERS
+                and publisher_group(str(row.get("domain", ""))) == publisher)
+
+
+def _same_news_story(left, right) -> bool:
+    if str(left["ticker"]) != str(right["ticker"]):
+        return False
+    if canonical_url(str(left["url"])) == canonical_url(str(right["url"])):
+        return True
+    titles = [re.sub(r"\W+", " ", _headline_text(row.get("title", "")).lower()).strip() for row in (left, right)]
+    if titles[0] and titles[0] == titles[1]:
+        return True
+    # Empty or teaser bodies must never identify two distinct headline records.
+    return bool(left.get("full_text_scored", False) and right.get("full_text_scored", False)
+                and bodies_near_duplicate(str(left.get("article_text", "")), str(right.get("article_text", ""))))
+
+
+def _deduplicate_scored_news(rows: pd.DataFrame) -> pd.DataFrame:
+    kept = []
+    for idx, row in rows.sort_values("full_text_scored", ascending=False, kind="stable").iterrows():
+        if not any(_same_news_story(row, rows.loc[prior]) for prior in kept):
+            kept.append(idx)
+    return rows.loc[kept].copy()
+
+
 def _eligible_unique_news(news: pd.DataFrame) -> pd.DataFrame:
-    """Fail closed: only verified, full-text, fully scored articles enter metrics."""
+    """Admit screened complete-body or explicitly scored headline evidence."""
     required = {
         "ticker", "pillar", "url", "article_text", "retrieval_state", "full_article_available",
         "relevance_decision", "scoring_eligible", "detected_language", "full_text_scored",
@@ -454,34 +507,31 @@ def _eligible_unique_news(news: pd.DataFrame) -> pd.DataFrame:
     probabilities = pd.to_numeric(rows["finbert_negative_probability"], errors="coerce")
     lengths = rows["article_text"].fillna("").astype(str).str.strip().str.len()
     truthy = lambda column: rows[column].map(lambda value: str(value).strip().lower() == "true")
+    full = truthy("full_article_available") & truthy("full_text_scored") & rows["retrieval_state"].eq("retrieved") & lengths.ge(500)
+    headline = (rows.get("headline_scored", pd.Series(False, index=rows.index)).eq(True)
+                & ~truthy("full_article_available") & ~truthy("full_text_scored")
+                & rows.get("model_input_source", pd.Series("", index=rows.index)).eq("headline only")
+                & rows.get("scoring_text", pd.Series("", index=rows.index)).fillna("").astype(str).eq(rows.get("title", pd.Series("", index=rows.index)).map(_headline_text))
+                & rows.get("title", pd.Series("", index=rows.index)).map(_headline_text).str.split().str.len().ge(4)
+                & ~rows["retrieval_state"].isin(["retrieved", "rejected_redirect"]))
     mask = (
         truthy("scoring_eligible")
-        & truthy("full_article_available")
-        & truthy("full_text_scored")
+        & (full | headline)
         & truthy("publication_window_valid")
-        & rows["retrieval_state"].eq("retrieved")
         & rows["relevance_decision"].eq("accepted")
         & rows["detected_language"].eq("en")
         & pd.to_numeric(rows["chunk_count"], errors="coerce").fillna(0).gt(0)
         & pd.to_numeric(rows["chunks_scored"], errors="coerce").eq(pd.to_numeric(rows["chunk_count"], errors="coerce"))
-        & lengths.ge(500)
         & probabilities.between(0.0, 1.0, inclusive="both")
     )
     rows = rows.loc[mask].copy()
     rows["finbert_negative_probability"] = probabilities.loc[rows.index]
-    rows = rows[rows.apply(lambda row: publisher_group(str(row["url"])) in APPROVED_NEWS_PUBLISHERS, axis=1)]
-    kept = []
-    seen_urls = set()
-    for idx, row in rows.iterrows():
-        url = canonical_url(str(row["url"]))
-        ticker = str(row["ticker"])
-        if (ticker, url) in seen_urls:
-            continue
-        if any(str(rows.loc[prior, "ticker"]) == ticker and bodies_near_duplicate(str(rows.loc[prior, "article_text"]), str(row["article_text"])) for prior in kept):
-            continue
-        seen_urls.add((ticker, url))
-        kept.append(idx)
-    return rows.loc[kept].copy()
+    if rows.empty:
+        return rows
+    rows = rows[rows.apply(_news_source_allowed, axis=1)]
+    rows["negative_evidence_weight"] = rows["full_text_scored"].map(lambda value: 1.0 if str(value).lower() == "true" else HEADLINE_NEGATIVE_WEIGHT)
+    rows["effective_negative_probability"] = rows["finbert_negative_probability"] * rows["negative_evidence_weight"]
+    return _deduplicate_scored_news(rows)
 
 
 def apply_incidents_and_rank(document_scores: pd.DataFrame, incidents: pd.DataFrame, news: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -514,6 +564,9 @@ def apply_incidents_and_rank(document_scores: pd.DataFrame, incidents: pd.DataFr
     usable_news = _eligible_unique_news(news)
     coverage_counts = usable_news.groupby(["ticker", "pillar"]).size().to_dict() if not usable_news.empty else {}
     detail["news_articles_found"] = [int(coverage_counts.get((r.ticker, r.pillar), 0)) for r in detail.itertuples()]
+    full_counts = usable_news[usable_news["full_text_scored"].eq(True)].groupby(["ticker", "pillar"]).size().to_dict() if not usable_news.empty else {}
+    detail["full_article_scored_count"] = [int(full_counts.get((r.ticker, r.pillar), 0)) for r in detail.itertuples()]
+    detail["headline_only_scored_count"] = detail["news_articles_found"] - detail["full_article_scored_count"]
     detail["news_article_target"] = detail["pillar"].map(NEWS_PILLAR_TARGETS).fillna(20).astype(int)
     detail["news_target_met"] = detail["news_articles_found"] >= detail["news_article_target"]
     # FinBERT sentiment contributes to the news-heavy provisional score, but
@@ -521,19 +574,23 @@ def apply_incidents_and_rank(document_scores: pd.DataFrame, incidents: pd.DataFr
     if not usable_news.empty and "finbert_negative_probability" in usable_news:
         probabilities = pd.to_numeric(usable_news["finbert_negative_probability"], errors="coerce")
         scored_news = usable_news.loc[probabilities.notna(), ["ticker", "pillar"]].copy()
-        scored_news["negative_probability"] = probabilities[probabilities.notna()]
+        scored_news["negative_probability"] = usable_news.loc[probabilities.notna(), "effective_negative_probability"]
         mean_negative = scored_news.groupby(["ticker", "pillar"])["negative_probability"].mean().to_dict()
+        scored_news["negative_probability"] = probabilities[probabilities.notna()]
+        mean_raw_negative = scored_news.groupby(["ticker", "pillar"])["negative_probability"].mean().to_dict()
     else:
         mean_negative = {}
-    detail["news_average_negative_probability"] = [mean_negative.get((r.ticker, r.pillar), float("nan")) for r in detail.itertuples()]
+        mean_raw_negative = {}
+    detail["news_average_negative_probability"] = [mean_raw_negative.get((r.ticker, r.pillar), float("nan")) for r in detail.itertuples()]
+    detail["news_average_effective_negative_probability"] = [mean_negative.get((r.ticker, r.pillar), float("nan")) for r in detail.itertuples()]
     detail["news_component_basis"] = [
-        "FinBERT mean negative probability" if bool(row.news_target_met) and pd.notna(row.news_average_negative_probability)
+        "FinBERT mean negative probability: full article 100%, headline 50%" if bool(row.news_target_met) and pd.notna(row.news_average_effective_negative_probability)
         else "neutral: article target or model coverage shortfall"
         for row in detail.itertuples()
     ]
     news_baseline = [
-        7.0 * (1.0 - float(row.news_average_negative_probability))
-        if bool(row.news_target_met) and pd.notna(row.news_average_negative_probability)
+        7.0 * (1.0 - float(row.news_average_effective_negative_probability))
+        if bool(row.news_target_met) and pd.notna(row.news_average_effective_negative_probability)
         else 3.5
         for row in detail.itertuples()
     ]
@@ -546,19 +603,25 @@ def apply_incidents_and_rank(document_scores: pd.DataFrame, incidents: pd.DataFr
     detail["report_weighted_component"] = (detail["document_evidence_score_0_7"] * REPORT_SCORE_WEIGHT).round(2)
     detail["news_weighted_component"] = (detail["news_risk_score_0_7"] * NEWS_SCORE_WEIGHT).round(2)
     detail["provisional_score_0_7"] = (detail["report_weighted_component"] + detail["news_weighted_component"]).round(2)
-    neg = usable_news[pd.to_numeric(usable_news.get("finbert_negative_probability", pd.Series(index=usable_news.index, dtype=float)), errors="coerce") >= NEGATIVE_REVIEW_THRESHOLD].groupby(["ticker", "pillar"]).size().to_dict() if not usable_news.empty else {}
+    negative_rows = usable_news[pd.to_numeric(usable_news.get("finbert_negative_probability", pd.Series(index=usable_news.index, dtype=float)), errors="coerce") >= NEGATIVE_REVIEW_THRESHOLD] if not usable_news.empty else usable_news
+    neg = negative_rows.groupby(["ticker", "pillar"]).size().to_dict() if not negative_rows.empty else {}
+    weighted_neg = negative_rows.groupby(["ticker", "pillar"])["negative_evidence_weight"].sum().to_dict() if not negative_rows.empty else {}
     detail["negative_news_candidates"] = [int(neg.get((r.ticker, r.pillar), 0)) for r in detail.itertuples()]
+    detail["weighted_negative_news_candidates"] = [float(weighted_neg.get((r.ticker, r.pillar), 0.0)) for r in detail.itertuples()]
     ranking = detail.groupby(["ticker", "company_name"], as_index=False).agg(
         overall_score_before_negative_news_penalty=("provisional_score_0_7", "sum"),
         negative_news_candidates=("negative_news_candidates", "sum"),
+        weighted_negative_news_candidates=("weighted_negative_news_candidates", "sum"),
+        full_article_scored_count=("full_article_scored_count", "sum"),
+        headline_only_scored_count=("headline_only_scored_count", "sum"),
         news_articles_found=("news_articles_found", "sum"),
         news_article_targets=("news_article_target", "sum"),
         news_targets_met=("news_target_met", "all"),
     )
-    # Discrete whole-company deduction: 0.5 points per seven eligible
-    # negative articles, rounded half-up, kept separate for auditability.
-    ranking["negative_news_penalty"] = ranking["negative_news_candidates"].map(
-        lambda count: math.floor((int(count) * NEGATIVE_NEWS_PENALTY_PER_7 / 7) + 0.5)
+    # Apply evidence weights before whole-number rounding: one full-article
+    # negative counts as 1, one headline-only negative as 0.5.
+    ranking["negative_news_penalty"] = ranking["weighted_negative_news_candidates"].map(
+        lambda count: math.floor((float(count) * NEGATIVE_NEWS_PENALTY_PER_7 / 7) + 0.5)
     )
     ranking["overall_score_before_negative_news_penalty"] = ranking["overall_score_before_negative_news_penalty"].round(2)
     ranking["overall_score_0_21"] = (

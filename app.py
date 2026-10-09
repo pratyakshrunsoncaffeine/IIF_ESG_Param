@@ -90,7 +90,7 @@ st.title("IIF ESG Parameterization Framework")
 st.caption("Upload complete annual reports without cropping pages, review topic evidence and adverse-news candidates, then compare provisional company scores.")
 
 with st.expander("How this prototype scores companies", expanded=False):
-    st.write("Each E, S and G score runs from 0 to 7. The provisional pillar score weights news at 70% and annual-report/BRSR evidence at 30%. The news targets are 20 Environmental, 20 Social and 50 Governance full-text-scored English articles per company. FinBERT negative probabilities affect the provisional news component when coverage targets are met; a shortfall receives a neutral component, not a clean-news score. A separate company-level negative-news penalty deducts 0.5 points per seven negative candidates, rounded half-up to a whole point. Sentiment is a review signal, not proof. Analyst-confirmed incidents can impose a severity penalty. The overall ranking is out of 21. The scan admits only The Economic Times, Business Standard, Mint, Moneycontrol, Reuters and PTI.")
+    st.write("Each E, S and G score runs from 0 to 7. The provisional pillar score weights news at 70% and annual-report/BRSR evidence at 30%. The news targets are 20 Environmental, 20 Social and 50 Governance eligible English articles per company. Readable full articles are scored with 100% negative weight. When retrieval fails, an eligible headline is scored with 50% negative weight. FinBERT probabilities affect the news component when coverage targets are met; a shortfall receives a neutral component. The separate negative-news penalty uses weighted candidates: one full-article negative counts as 1, one headline-only negative as 0.5. Deduct 0.5 points per seven weighted negative candidates, rounded half-up to a whole point. Sentiment is a review signal, not proof. Analyst-confirmed incidents can impose a severity penalty. The overall ranking is out of 21. The scan admits only The Economic Times, Business Standard, Mint, Moneycontrol, Reuters and PTI.")
     st.write("To confirm a news-reported incident, enter direct article URLs from five distinct approved publishers. Count each publisher once and exclude syndicated or repeated copies of the same report. The only one-document exception is an HTTPS link on a .gov.in, .nic.in or rbi.org.in domain to a final regulator order or sanction, final court judgment, or final statutory authority decision. Preliminary notices, allegations, company statements and ordinary filings do not qualify as final findings.")
     st.warning(TAXONOMY.get("note", "Review the topic dictionaries before relying on comparisons."))
 
@@ -167,7 +167,7 @@ if brsr_uploads:
 
 with st.expander("News scan options", expanded=False):
     run_news = st.checkbox("Search GDELT and Google News RSS, then classify English candidates with FinBERT", value=True, key="run_news")
-    st.caption("Per-company targets: 20 Environmental, 20 Social and 50 Governance accepted full-text-scored English articles. Search indexes and publisher access can return fewer; the results show counts and shortfalls. Queries request up to 365 days, but historical coverage is not guaranteed. FinBERT model files download the first time the scan runs.")
+    st.caption("Per-company targets: 20 Environmental, 20 Social and 50 Governance eligible English articles. Complete articles receive 100% negative weight; eligible headlines receive 50% when the body is unavailable. Results show both evidence counts and shortfalls. Queries request up to 365 days, but historical coverage is not guaranteed. FinBERT model files download the first time the scan runs.")
 run = st.button("Analyse reports and rank companies", type="primary", use_container_width=True)
 annual_by_name = {file.name: file for file in annual_uploads}
 brsr_by_name = {file.name: file for file in brsr_uploads}
@@ -313,10 +313,11 @@ if analysis:
         st.dataframe(analysis["coverage"], hide_index=True, use_container_width=True)
     if run_news:
         news_data = analysis["news"]
-        st.markdown("**Accepted news coverage (full text scored, English, and eligible)**")
+        st.markdown("**Accepted news coverage (full article or headline, English, and eligible)**")
         accepted = news_data[news_data.get("scoring_eligible", pd.Series(False, index=news_data.index)).fillna(False).astype(bool)] if not news_data.empty else news_data
         discovered = news_data.groupby(["ticker", "pillar"]).size().to_dict() if not news_data.empty else {}
         accepted_counts = accepted.groupby(["ticker", "pillar"]).size().to_dict() if not accepted.empty else {}
+        full_counts = accepted[accepted["full_text_scored"].eq(True)].groupby(["ticker", "pillar"]).size().to_dict() if not accepted.empty else {}
         eligible_rows = []
         for company in analysis["companies"]:
             for pillar in ("E", "S", "G"):
@@ -324,17 +325,19 @@ if analysis:
                 target = int(NEWS_PILLAR_TARGETS[pillar])
                 eligible_rows.append({"ticker": company["ticker"], "pillar": pillar,
                                       "discovered_candidates": int(discovered.get((company["ticker"], pillar), 0)),
-                                      "accepted_full_text_scored": count, "target": target,
+                                      "accepted_scored": count,
+                                      "full_article_scored": int(full_counts.get((company["ticker"], pillar), 0)),
+                                      "headline_only_scored": count - int(full_counts.get((company["ticker"], pillar), 0)), "target": target,
                                       "shortfall": max(0, target - count)})
         st.dataframe(pd.DataFrame(eligible_rows), hide_index=True, use_container_width=True)
-        display_columns = [col for col in ["ticker", "pillar", "title", "publisher", "domain", "published_at", "discovery_source", "detected_language", "retrieval_state", "retrieval_reason", "full_article_available", "relevance_decision", "relevance_reason", "attribution_evidence", "scoring_eligible", "duplicate_of", "scoring_error", "full_text_scored", "chunk_count", "chunks_scored", "fetch_status", "model_input_source", "finbert_label", "finbert_negative_probability", "needs_analyst_review", "url"] if col in news_data.columns]
+        display_columns = [col for col in ["ticker", "pillar", "title", "publisher", "domain", "published_at", "discovery_source", "detected_language", "retrieval_state", "retrieval_reason", "full_article_available", "relevance_decision", "relevance_reason", "attribution_evidence", "scoring_eligible", "duplicate_of", "scoring_error", "full_text_scored", "headline_scored", "chunk_count", "chunks_scored", "fetch_status", "model_input_source", "negative_evidence_weight", "finbert_label", "finbert_negative_probability", "effective_negative_probability", "needs_analyst_review", "url"] if col in news_data.columns]
         if news_data.empty:
             st.info("No news candidates returned. Review the coverage and query errors before interpreting this as no adverse news.")
         elif "scoring_eligible" in news_data:
             rejected = news_data[~news_data["scoring_eligible"].fillna(False).astype(bool)]
             if not accepted.empty:
                 st.dataframe(accepted[display_columns].sort_values(["ticker", "pillar", "finbert_negative_probability"], ascending=[True, True, False], na_position="last"), hide_index=True, use_container_width=True)
-            st.markdown(f"**Rejected, unreadable, or unscored news audit ({len(rejected)})**")
+            st.markdown(f"**Rejected or unscored news audit ({len(rejected)})**")
             if not rejected.empty:
                 st.dataframe(rejected[display_columns], hide_index=True, use_container_width=True)
     if not analysis["errors"].empty:
@@ -378,7 +381,7 @@ if analysis:
         st.bar_chart(rankings.set_index("ticker")["overall_score_0_21"], y_label="Provisional score out of 21")
         st.markdown("**Pillar score detail**")
         st.dataframe(pillar_detail, hide_index=True, use_container_width=True)
-        st.caption("Score formula: 70% FinBERT news signal and 30% annual-report/BRSR evidence. The separate negative-news penalty deducts 0.5 points per seven negative candidates, rounded half-up to a whole point; the final score cannot fall below zero. A pillar below its full-text-scored English article target receives a neutral news component and is flagged; it is not treated as having no controversy. FinBERT sentiment is provisional and never proves an incident. Analyst-confirmed incidents that satisfy the source corroboration rule can impose a severity penalty without double-counting the same sentiment.")
+        st.caption("Score formula: 70% FinBERT news signal and 30% annual-report/BRSR evidence. Headline-only evidence receives 50% of the negative weight; full articles receive 100%. The separate negative-news penalty deducts 0.5 points per seven weighted negative candidates, rounded half-up to a whole point; the final score cannot fall below zero. Both eligible evidence types count towards article targets, with their counts shown separately. A pillar below its eligible English article target receives a neutral news component and is flagged. FinBERT sentiment is provisional and never proves an incident. Analyst-confirmed incidents that satisfy the source corroboration rule can impose a severity penalty without double-counting the same sentiment.")
         st.download_button("Download company ranking CSV", rankings.to_csv(index=False).encode("utf-8-sig"), "iif_esg_company_ranking.csv", "text/csv")
         st.download_button("Download pillar score detail CSV", pillar_detail.to_csv(index=False).encode("utf-8-sig"), "iif_esg_pillar_scores.csv", "text/csv")
     except Exception as exc:
