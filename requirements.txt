@@ -11,5 +11,7 @@ transformers>=4.45,<5
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.14.0+cpu
 trafilatura>=2.0
+googlenewsdecoder>=0.2.1,<0.3
+selectolax>=0.4.12,<1
 langdetect>=1.0.9
 pytest>=8,<10

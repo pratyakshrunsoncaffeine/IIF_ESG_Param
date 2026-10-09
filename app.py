@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
+import json
 import os
 import tempfile
 import time
@@ -48,6 +50,7 @@ from esg.exporter import export_results
 from esg.keyword_matcher import KeywordMatcher
 from esg.pipeline import process_pdf_bytes
 from esg.streamlit_adapter import SCORE_COLUMNS, records_to_score_evidence
+from esg.documents import DocumentMappingError, group_documents
 
 st.set_page_config(page_title="IIF ESG Parameterization", page_icon="🌱", layout="wide")
 
@@ -87,7 +90,7 @@ st.title("IIF ESG Parameterization Framework")
 st.caption("Upload complete annual reports without cropping pages, review topic evidence and adverse-news candidates, then compare provisional company scores.")
 
 with st.expander("How this prototype scores companies", expanded=False):
-    st.write("Each E, S and G score runs from 0 to 7. The provisional pillar score weights news at 70% and annual-report evidence at 30%. The news targets are 20 Environmental, 20 Social and 50 Governance articles per company. FinBERT negative probabilities affect the provisional news component when coverage targets are met; a shortfall receives a neutral component, not a clean-news score. Sentiment is a review signal, not proof. Analyst-confirmed incidents can impose a severity penalty. The overall ranking is out of 21. The scan admits only The Economic Times, Business Standard, Mint, Moneycontrol, Reuters and PTI.")
+    st.write("Each E, S and G score runs from 0 to 7. The provisional pillar score weights news at 70% and annual-report/BRSR evidence at 30%. The news targets are 20 Environmental, 20 Social and 50 Governance full-text-scored English articles per company. FinBERT negative probabilities affect the provisional news component when coverage targets are met; a shortfall receives a neutral component, not a clean-news score. A separate company-level negative-news penalty deducts 0.5 points per seven negative candidates, rounded half-up to a whole point. Sentiment is a review signal, not proof. Analyst-confirmed incidents can impose a severity penalty. The overall ranking is out of 21. The scan admits only The Economic Times, Business Standard, Mint, Moneycontrol, Reuters and PTI.")
     st.write("To confirm a news-reported incident, enter direct article URLs from five distinct approved publishers. Count each publisher once and exclude syndicated or repeated copies of the same report. The only one-document exception is an HTTPS link on a .gov.in, .nic.in or rbi.org.in domain to a final regulator order or sanction, final court judgment, or final statutory authority decision. Preliminary notices, allegations, company statements and ordinary filings do not qualify as final findings.")
     st.warning(TAXONOMY.get("note", "Review the topic dictionaries before relying on comparisons."))
 
@@ -96,34 +99,47 @@ with st.expander("Full-report extraction options", expanded=False):
     use_ocr = st.checkbox(
         "Use OCR for pages with little or no embedded text",
         value=False,
+        key="use_ocr",
         help="Reads the whole uploaded report. OCR is applied only to pages with little embedded text and may take longer.",
     )
+    use_tables = st.checkbox(
+        "Extract numeric data from report tables",
+        value=False,
+        key="use_tables",
+        help="Table extraction can be resource intensive on large PDFs. Enable only when needed.",
+    )
     st.caption("Each ESG dataset row retains its matched statement, nearby context, page number, detected metrics, claim type, and extraction confidence. Tables are extracted alongside page text.")
-uploads = st.file_uploader(
-    "Select one PDF per company. You can upload several reports at once.",
+annual_uploads = st.file_uploader(
+    "Annual reports: upload one PDF per company. You can upload several reports at once.",
     type=["pdf"],
     accept_multiple_files=True,
+    key="annual_report_uploads",
+)
+brsr_uploads = st.file_uploader(
+    "Optional standalone SEBI BRSR PDFs (attach each to a company below)",
+    type=["pdf"], accept_multiple_files=True, key="optional_brsr_uploads",
 )
 
-if not uploads:
-    st.info("Upload one or more PDFs to enter ticker details and start a comparison.")
+if not annual_uploads:
+    st.info("Upload one or more annual reports to enter ticker details and start a comparison. BRSR uploads are optional.")
     st.stop()
 
-names = [file.name for file in uploads]
-if len(names) != len(set(names)):
-    st.error("The uploaded files contain duplicate filenames. Rename them and upload again so each ticker can be mapped correctly.")
-    st.stop()
-
+annual_names = [file.name for file in annual_uploads]
+brsr_names = [file.name for file in brsr_uploads]
+annual_mapping_key = "annual_company_mapping_" + hashlib.sha256(json.dumps(annual_names).encode()).hexdigest()[:12]
+brsr_mapping_key = "brsr_company_mapping_" + hashlib.sha256(json.dumps([annual_names, brsr_names]).encode()).hexdigest()[:12]
 mapping_defaults = pd.DataFrame({
-    "PDF file": names,
-    "Ticker": [""] * len(names),
-    "Company name": [""] * len(names),
-    "Aliases (separate with ;)": [""] * len(names),
+    "PDF file": annual_names,
+    "Ticker": [""] * len(annual_names),
+    "Company name": [""] * len(annual_names),
+    "Aliases (separate with ;)": [""] * len(annual_names),
+    "Fiscal year (optional)": [""] * len(annual_names),
 })
-st.write("Enter one ticker for each report. Company name and aliases improve news matching.")
-mapping = st.data_editor(
-    mapping_defaults,
-    key="company_mapping",
+st.write("Enter one ticker per annual report. Use the same optional fiscal year for all documents attached to that ticker. Company name and aliases improve news matching.")
+annual_mapping_defaults = mapping_defaults.rename(columns={"Fiscal year (optional)": "Fiscal year"})
+annual_mapping = st.data_editor(
+    annual_mapping_defaults,
+    key=annual_mapping_key,
     hide_index=True,
     num_rows="fixed",
     use_container_width=True,
@@ -132,36 +148,51 @@ mapping = st.data_editor(
         "Ticker": st.column_config.TextColumn(required=True, help="Use an exchange-qualified ticker, such as ABC.NS."),
         "Company name": st.column_config.TextColumn(),
         "Aliases (separate with ;)": st.column_config.TextColumn(),
+        "Fiscal year": st.column_config.TextColumn(help="Optional, for example FY2025."),
     },
 )
+brsr_mapping = pd.DataFrame(columns=["PDF file", "Ticker", "Company name", "Fiscal year"])
+if brsr_uploads:
+    st.caption("Assign each BRSR to a ticker from the annual-report table. If you enter a company name, it must match that company's annual-report name or alias. A blank fiscal year inherits the annual-report year. The app uses your mapping and does not independently verify the issuer inside the PDF.")
+    known_tickers = sorted({str(value).strip().upper() for value in annual_mapping["Ticker"].fillna("") if str(value).strip()})
+    brsr_mapping = st.data_editor(
+        pd.DataFrame({"PDF file": brsr_names, "Ticker": [""] * len(brsr_names),
+                      "Company name": [""] * len(brsr_names), "Fiscal year": [""] * len(brsr_names)}),
+        key=brsr_mapping_key, hide_index=True, num_rows="fixed", use_container_width=True,
+        column_config={"PDF file": st.column_config.TextColumn(disabled=True),
+                       "Ticker": st.column_config.SelectboxColumn(options=known_tickers, required=True),
+                       "Company name": st.column_config.TextColumn(),
+                       "Fiscal year": st.column_config.TextColumn()},
+    )
 
 with st.expander("News scan options", expanded=False):
-    run_news = st.checkbox("Search GDELT and Google News RSS, then classify English candidates with FinBERT", value=True)
-    st.caption("Per-company search targets: 20 Environmental, 20 Social and 50 Governance articles. Search indexes and publisher access can return fewer; the results show counts and shortfalls. Queries request up to 365 days, but historical coverage is not guaranteed. FinBERT model files download the first time the scan runs.")
-
+    run_news = st.checkbox("Search GDELT and Google News RSS, then classify English candidates with FinBERT", value=True, key="run_news")
+    st.caption("Per-company targets: 20 Environmental, 20 Social and 50 Governance accepted full-text-scored English articles. Search indexes and publisher access can return fewer; the results show counts and shortfalls. Queries request up to 365 days, but historical coverage is not guaranteed. FinBERT model files download the first time the scan runs.")
 run = st.button("Analyse reports and rank companies", type="primary", use_container_width=True)
+annual_by_name = {file.name: file for file in annual_uploads}
+brsr_by_name = {file.name: file for file in brsr_uploads}
+analysis_signature = hashlib.sha256(json.dumps({
+    "annual": [(f.name, hashlib.sha256(f.getvalue()).hexdigest()) for f in annual_uploads],
+    "brsr": [(f.name, hashlib.sha256(f.getvalue()).hexdigest()) for f in brsr_uploads],
+    "annual_mapping": annual_mapping.to_dict(orient="records"),
+    "brsr_mapping": brsr_mapping.to_dict(orient="records"),
+    "news": bool(st.session_state.get("run_news", True)), "ocr": bool(st.session_state.get("use_ocr", False)),
+    "tables": bool(st.session_state.get("use_tables", False)),
+}, sort_keys=True, default=str).encode()).hexdigest()
 if run:
-    tickers = mapping["Ticker"].fillna("").astype(str).str.strip().str.upper()
-    if (tickers == "").any():
-        st.error("Enter a ticker for every PDF before starting.")
+    annual_rows = [{"file_name": row["PDF file"], "ticker": row.get("Ticker"),
+                    "company_name": row.get("Company name"), "aliases": row.get("Aliases (separate with ;)"),
+                    "fiscal_year": row.get("Fiscal year"), "content": annual_by_name[row["PDF file"]].getvalue()}
+                   for row in annual_mapping.to_dict(orient="records")]
+    brsr_rows = [{"file_name": row["PDF file"], "ticker": row.get("Ticker"),
+                  "company_name": row.get("Company name"), "fiscal_year": row.get("Fiscal year"),
+                  "content": brsr_by_name[row["PDF file"]].getvalue()}
+                 for row in brsr_mapping.to_dict(orient="records")]
+    try:
+        companies = group_documents(annual_rows, brsr_rows)
+    except DocumentMappingError as exc:
+        st.error(str(exc))
         st.stop()
-    if tickers.duplicated().any():
-        st.error("Each ticker must appear only once. Use one report per company in a comparison.")
-        st.stop()
-
-    companies = []
-    upload_by_name = {file.name: file for file in uploads}
-    for row in mapping.to_dict(orient="records"):
-        ticker = str(row["Ticker"]).strip().upper()
-        alias_col = next((key for key in row if key.startswith("Aliases")), "")
-        aliases = [item.strip() for item in str(row.get(alias_col, "") or "").split(";") if item.strip()]
-        companies.append({
-            "ticker": ticker,
-            "company_name": str(row.get("Company name", "") or "").strip(),
-            "aliases": aliases,
-            "report_name": row["PDF file"],
-            "content": upload_by_name[row["PDF file"]].getvalue(),
-        })
 
     evidence_frames, page_rows, error_rows, coverage_frames, news_frames = [], [], [], [], []
     dataset_records, dataset_errors = [], []
@@ -169,40 +200,45 @@ if run:
     esg_matcher = load_esg_matcher()
     status = st.status("Processing uploaded reports and news…", expanded=True)
     for company in companies:
-        status.write(f"Extracting {company['report_name']} for {company['ticker']}")
-        extractor_errors, extracted_pages = [], []
-        try:
-            display_company = company["company_name"] or company["ticker"]
-            records = process_pdf_bytes(
-                company["content"], company["report_name"], display_company,
-                esg_matcher, DEFAULTS, ocr=use_ocr, errors=extractor_errors,
-                page_status=extracted_pages,
-            )
-            for record in records:
-                record["ticker"] = company["ticker"]
-            dataset_records.extend(records)
-            dataset_errors.extend({"ticker": company["ticker"], **row} for row in extractor_errors)
-            evidence_rows = records_to_score_evidence(
-                records, company["ticker"], display_company, company["report_name"]
-            )
-            evidence_frames.append(pd.DataFrame(evidence_rows, columns=SCORE_COLUMNS))
-            for page in extracted_pages:
-                page_rows.append({"ticker": company["ticker"], "report_name": company["report_name"], **page})
-            if not extracted_pages:
-                error_rows.extend({
-                    "ticker": company["ticker"],
-                    "stage": row.get("error_type", "PDF extraction"),
-                    "error": row.get("message", "PDF could not be read"),
-                } for row in extractor_errors)
-        except Exception as exc:
-            error_rows.append({"ticker": company["ticker"], "stage": "PDF extraction", "error": f"{type(exc).__name__}: {exc}"})
-            evidence_frames.append(pd.DataFrame())
-            continue
+        display_company = company["company_name"] or company["ticker"]
+        annual_readable = False
+        for document in company["documents"]:
+            status.write(f"Extracting {document['source_file']} ({document['document_type']}) for {company['ticker']}")
+            extractor_errors, extracted_pages = [], []
+            try:
+                records = process_pdf_bytes(document["content"], document["source_file"], display_company,
+                    esg_matcher, DEFAULTS, ocr=use_ocr, extract_tables=use_tables,
+                    errors=extractor_errors, page_status=extracted_pages)
+                for record in records:
+                    record.update(ticker=company["ticker"], document_type=document["document_type"],
+                                  fiscal_year=document["fiscal_year"])
+                dataset_records.extend(records)
+                dataset_errors.extend({"ticker": company["ticker"], "document_type": document["document_type"], **row} for row in extractor_errors)
+                evidence_rows = records_to_score_evidence(records, company["ticker"], display_company,
+                    document["source_file"], document["document_type"], document["fiscal_year"])
+                evidence_frames.append(pd.DataFrame(evidence_rows, columns=SCORE_COLUMNS))
+                for page in extracted_pages:
+                    page_rows.append({"ticker": company["ticker"], "document_type": document["document_type"],
+                                      "fiscal_year": document["fiscal_year"], "report_name": document["source_file"], **page})
+                status.write(f"Finished {document['source_file']}: {len(extracted_pages)} pages checked, {len(records)} evidence rows, {len(extractor_errors)} extraction issues")
+                if document["document_type"] == "annual_report" and any(int(page.get("characters", 0) or 0) > 0 for page in extracted_pages):
+                    annual_readable = True
+                if not extracted_pages:
+                    error_rows.extend({"ticker": company["ticker"], "document_type": document["document_type"],
+                        "stage": row.get("error_type", "PDF extraction"),
+                        "error": row.get("message", "PDF could not be read")} for row in extractor_errors)
+            except Exception as exc:
+                error_rows.append({"ticker": company["ticker"], "document_type": document["document_type"],
+                                   "stage": "PDF extraction", "error": f"{type(exc).__name__}: {exc}"})
+        company["_annual_readable"] = annual_readable
         if run_news:
             status.write(f"Searching GDELT and Google News RSS for {company['ticker']}")
             try:
                 news, errors, coverage = scan_news_for_company(company, date.today())
                 if not news.empty:
+                    # Carry the selected identity terms through retrieval so full-text
+                    # relevance screening can bind adverse conduct to this issuer.
+                    news["aliases"] = [company.get("aliases", []) for _ in range(len(news))]
                     news_frames.append(news)
                 if not errors.empty:
                     error_rows.extend(errors.to_dict(orient="records"))
@@ -210,8 +246,10 @@ if run:
             except Exception as exc:
                 error_rows.append({"ticker": company["ticker"], "stage": "News search", "error": f"{type(exc).__name__}: {exc}"})
 
-    successful_tickers = {row["ticker"] for row in page_rows}
+    successful_tickers = {company["ticker"] for company in companies if company.get("_annual_readable")}
     successful_companies = [company for company in companies if company["ticker"] in successful_tickers]
+    for company in successful_companies:
+        company.pop("_annual_readable", None)
     if not successful_companies:
         status.update(label="No reports could be processed", state="error", expanded=True)
         st.error("No PDF text was extracted. Check the files and install Tesseract OCR for scanned reports.")
@@ -222,13 +260,29 @@ if run:
     news = pd.concat(news_frames, ignore_index=True) if news_frames else pd.DataFrame()
     if run_news and not news.empty:
         status.write("Classifying candidate news with FinBERT")
+        classifier = None
         try:
             classifier = load_finbert()
-            news = classify_news(news, classifier)
         except Exception as exc:
             error_rows.append({"ticker": "ALL", "stage": "FinBERT", "error": f"{type(exc).__name__}: {exc}"})
+        news_progress_bar = status.progress(0, text="Retrieving and screening full articles")
+        def news_progress(event):
+            step = event.get("event", "news")
+            done, total = event.get("processed", 0), event.get("total", 0)
+            title = str(event.get("title", ""))[:100]
+            chunks = event.get("chunk_count")
+            chunk_note = f"; {event.get('chunks_scored', 0)}/{chunks} chunks scored" if chunks is not None else ""
+            progress = min(1.0, done / total) if total else 0.0
+            news_progress_bar.progress(progress, text=f"News {step.replace('_', ' ')} {done}/{total}{chunk_note}: {title}")
+        try:
+            # Even without model weights, fetch and screen every candidate so
+            # rejected, unreadable and unscored articles remain in the audit.
+            news = classify_news(news, classifier, progress_callback=news_progress)
+        except Exception as exc:
+            error_rows.append({"ticker": "ALL", "stage": "News article screening", "error": f"{type(exc).__name__}: {exc}"})
             news["finbert_label"] = "not scored: FinBERT unavailable"
             news["finbert_negative_probability"] = float("nan")
+            news["scoring_eligible"] = False
             news["needs_analyst_review"] = True
     document_scores = calculate_document_scores(evidence, successful_companies)
     save_evidence_batch(run_id, news, evidence, dataset_records, DB_PATH)
@@ -245,20 +299,44 @@ if run:
         "dataset_files": dataset_downloads(dataset_records, dataset_errors) if (dataset_records or dataset_errors) else {},
         "coverage": pd.concat(coverage_frames, ignore_index=True) if coverage_frames else pd.DataFrame(),
         "pages": pd.DataFrame(page_rows),
+        "input_signature": analysis_signature,
     }
     status.update(label="Analysis complete", state="complete", expanded=False)
 
 analysis = st.session_state.get("iif_esg_analysis")
+if analysis and analysis.get("input_signature") != analysis_signature:
+    analysis = None
 if analysis:
     st.subheader("2. Review coverage and news")
     if not analysis["coverage"].empty:
         st.markdown("**News source coverage**")
         st.dataframe(analysis["coverage"], hide_index=True, use_container_width=True)
-    if not analysis["news"].empty:
-        display_columns = [col for col in ["ticker", "pillar", "title", "publisher", "domain", "published_at", "discovery_source", "detected_language", "fetch_status", "model_input_source", "finbert_label", "finbert_negative_probability", "needs_analyst_review", "url"] if col in analysis["news"].columns]
-        st.dataframe(analysis["news"][display_columns].sort_values(["ticker", "finbert_negative_probability"], ascending=[True, False], na_position="last"), hide_index=True, use_container_width=True)
-    elif run_news:
-        st.info("No news candidates returned. Review the coverage and query errors before interpreting this as no adverse news.")
+    if run_news:
+        news_data = analysis["news"]
+        st.markdown("**Accepted news coverage (full text scored, English, and eligible)**")
+        accepted = news_data[news_data.get("scoring_eligible", pd.Series(False, index=news_data.index)).fillna(False).astype(bool)] if not news_data.empty else news_data
+        discovered = news_data.groupby(["ticker", "pillar"]).size().to_dict() if not news_data.empty else {}
+        accepted_counts = accepted.groupby(["ticker", "pillar"]).size().to_dict() if not accepted.empty else {}
+        eligible_rows = []
+        for company in analysis["companies"]:
+            for pillar in ("E", "S", "G"):
+                count = int(accepted_counts.get((company["ticker"], pillar), 0))
+                target = int(NEWS_PILLAR_TARGETS[pillar])
+                eligible_rows.append({"ticker": company["ticker"], "pillar": pillar,
+                                      "discovered_candidates": int(discovered.get((company["ticker"], pillar), 0)),
+                                      "accepted_full_text_scored": count, "target": target,
+                                      "shortfall": max(0, target - count)})
+        st.dataframe(pd.DataFrame(eligible_rows), hide_index=True, use_container_width=True)
+        display_columns = [col for col in ["ticker", "pillar", "title", "publisher", "domain", "published_at", "discovery_source", "detected_language", "retrieval_state", "retrieval_reason", "full_article_available", "relevance_decision", "relevance_reason", "attribution_evidence", "scoring_eligible", "duplicate_of", "scoring_error", "full_text_scored", "chunk_count", "chunks_scored", "fetch_status", "model_input_source", "finbert_label", "finbert_negative_probability", "needs_analyst_review", "url"] if col in news_data.columns]
+        if news_data.empty:
+            st.info("No news candidates returned. Review the coverage and query errors before interpreting this as no adverse news.")
+        elif "scoring_eligible" in news_data:
+            rejected = news_data[~news_data["scoring_eligible"].fillna(False).astype(bool)]
+            if not accepted.empty:
+                st.dataframe(accepted[display_columns].sort_values(["ticker", "pillar", "finbert_negative_probability"], ascending=[True, True, False], na_position="last"), hide_index=True, use_container_width=True)
+            st.markdown(f"**Rejected, unreadable, or unscored news audit ({len(rejected)})**")
+            if not rejected.empty:
+                st.dataframe(rejected[display_columns], hide_index=True, use_container_width=True)
     if not analysis["errors"].empty:
         with st.expander(f"Processing and search issues ({len(analysis['errors'])})"):
             st.dataframe(analysis["errors"], hide_index=True, use_container_width=True)
@@ -300,7 +378,7 @@ if analysis:
         st.bar_chart(rankings.set_index("ticker")["overall_score_0_21"], y_label="Provisional score out of 21")
         st.markdown("**Pillar score detail**")
         st.dataframe(pillar_detail, hide_index=True, use_container_width=True)
-        st.caption("Score formula: 70% FinBERT news signal and 30% annual-report evidence. A pillar below its article target receives a neutral news component and is flagged; it is not treated as having no controversy. FinBERT sentiment is provisional and never proves an incident. Analyst-confirmed incidents that satisfy the source corroboration rule can impose a severity penalty without double-counting the same sentiment.")
+        st.caption("Score formula: 70% FinBERT news signal and 30% annual-report/BRSR evidence. The separate negative-news penalty deducts 0.5 points per seven negative candidates, rounded half-up to a whole point; the final score cannot fall below zero. A pillar below its full-text-scored English article target receives a neutral news component and is flagged; it is not treated as having no controversy. FinBERT sentiment is provisional and never proves an incident. Analyst-confirmed incidents that satisfy the source corroboration rule can impose a severity penalty without double-counting the same sentiment.")
         st.download_button("Download company ranking CSV", rankings.to_csv(index=False).encode("utf-8-sig"), "iif_esg_company_ranking.csv", "text/csv")
         st.download_button("Download pillar score detail CSV", pillar_detail.to_csv(index=False).encode("utf-8-sig"), "iif_esg_pillar_scores.csv", "text/csv")
     except Exception as exc:
@@ -322,6 +400,7 @@ if analysis:
     else:
         visible_dataset_columns = [column for column in [
             "ticker", "company", "source_file", "page_number", "pillar", "topic",
+            "document_type", "fiscal_year",
             "keyword", "claim_type", "matched_sentence", "value", "unit",
             "reporting_period", "target_value", "target_year", "baseline_year",
             "direction", "confidence", "ocr_used", "table_index",

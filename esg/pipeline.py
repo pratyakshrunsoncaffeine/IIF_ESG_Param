@@ -122,11 +122,12 @@ def table_records(page: dict, pdf_page, matcher: KeywordMatcher, errors: list[di
 def process_pdf(path: Path, matcher: KeywordMatcher, settings, *, ocr: bool,
                 errors: list[dict], source_name: str | None = None,
                 company_name: str | None = None,
-                page_status: list[dict] | None = None) -> list[dict]:
+                page_status: list[dict] | None = None,
+                extract_tables: bool = False) -> list[dict]:
     records = []
     display_name = source_name or path.name
     try:
-        table_document = None
+        table_document = pdfplumber.open(path) if extract_tables else None
     except Exception as exc:
         table_document = None
         errors.append({"source_file": display_name, "page_number": None,
@@ -144,7 +145,7 @@ def process_pdf(path: Path, matcher: KeywordMatcher, settings, *, ocr: bool,
                 page_status.append({
                     "source_file": page["source_file"],
                     "page_number": page["page_number"],
-                    "characters": len(page["raw_text"]),
+                    "characters": len(page["raw_text"].strip()),
                     "ocr_used": page["ocr_used"],
                 })
             records.extend(text_records(page, matcher))
@@ -166,7 +167,8 @@ def process_pdf(path: Path, matcher: KeywordMatcher, settings, *, ocr: bool,
 
 def process_pdf_bytes(pdf_bytes: bytes, source_name: str, company_name: str,
                       matcher: KeywordMatcher, settings, *, ocr: bool,
-                      errors: list[dict], page_status: list[dict] | None = None) -> list[dict]:
+                      errors: list[dict], page_status: list[dict] | None = None,
+                      extract_tables: bool = False) -> list[dict]:
     """Process an uploaded PDF from memory while keeping temporary files isolated."""
     safe_name = Path(source_name).name or "uploaded_report.pdf"
     with tempfile.TemporaryDirectory(prefix="iif_esg_") as temp_dir:
@@ -175,7 +177,7 @@ def process_pdf_bytes(pdf_bytes: bytes, source_name: str, company_name: str,
         first_new_error = len(errors)
         records = process_pdf(path, matcher, settings, ocr=ocr, errors=errors,
                               source_name=safe_name, company_name=company_name,
-                              page_status=page_status)
+                              page_status=page_status, extract_tables=extract_tables)
         for error in errors[first_new_error:]:
             if error.get("source_file") == path.name:
                 error["source_file"] = safe_name

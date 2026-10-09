@@ -12,7 +12,16 @@ def test_news_has_larger_weight_and_shortfall_is_neutral():
     news_rows = []
     for pillar, target in NEWS_PILLAR_TARGETS.items():
         found = target if pillar == "E" else 0
-        news_rows.extend({"ticker": "ABC.NS", "pillar": pillar, "canonical_url": f"https://news.example/{pillar}/{i}", "finbert_negative_probability": 0.0} for i in range(found))
+        news_rows.extend({
+            "ticker": "ABC.NS", "pillar": pillar,
+            "url": f"https://livemint.com/article/{pillar}/{i}",
+            "article_text": f"Full article body {pillar} {i} " + " ".join(f"story{pillar}{i}token{word}" for word in range(150)),
+            "retrieval_state": "retrieved", "full_article_available": True,
+            "relevance_decision": "accepted", "scoring_eligible": True,
+            "detected_language": "en", "full_text_scored": True, "publication_window_valid": True,
+            "chunk_count": 1, "chunks_scored": 1,
+            "finbert_negative_probability": 0.0,
+        } for i in range(found))
     news = pd.DataFrame(news_rows)
     ranking, detail = apply_incidents_and_rank(scores, pd.DataFrame(), news)
     e_score = detail.set_index("pillar").loc["E"]

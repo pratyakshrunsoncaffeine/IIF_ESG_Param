@@ -71,3 +71,39 @@ def test_uploaded_pdf_bytes_keep_report_name_company_and_page_status():
     assert page_status == [{"source_file": "annual_report.pdf", "page_number": 1,
                             "characters": len(sentence), "ocr_used": False}]
     assert not errors
+
+
+def test_table_extraction_is_opt_in_and_reads_numeric_table_rows():
+    dictionary = load_dictionary(ROOT / "data" / "normalized_dictionary.json")
+    matcher = KeywordMatcher(dictionary)
+    page = {"company": "temporary", "source_file": "uploaded_report.pdf", "page_number": 1,
+            "raw_text": "Ordinary report page.", "cleaned_text": "Ordinary report page.", "ocr_used": False}
+
+    class FakePdfPage:
+        def extract_tables(self):
+            return [[ ["Metric", "FY2025"], ["Scope 1 emissions", "12%"] ]]
+
+    class FakeTableDocument:
+        pages = [FakePdfPage()]
+
+        def close(self):
+            pass
+
+    # The safe default never opens a second PDF parser for table extraction.
+    with patch.object(pipeline.pdfplumber, "open") as open_pdf, \
+            patch.object(pipeline, "extract_pages", return_value=iter([page])):
+        default_records = pipeline.process_pdf_bytes(
+            b"test-pdf-bytes", "annual.pdf", "Example Ltd", matcher, DEFAULTS,
+            ocr=False, errors=[], page_status=[],
+        )
+    open_pdf.assert_not_called()
+    assert default_records == []
+
+    with patch.object(pipeline.pdfplumber, "open", return_value=FakeTableDocument()) as open_pdf, \
+            patch.object(pipeline, "extract_pages", return_value=iter([page])):
+        table_records = pipeline.process_pdf_bytes(
+            b"test-pdf-bytes", "annual.pdf", "Example Ltd", matcher, DEFAULTS,
+            ocr=False, errors=[], page_status=[], extract_tables=True,
+        )
+    open_pdf.assert_called_once()
+    assert any(record.get("table_index") == 1 and record.get("value") == 12.0 for record in table_records)

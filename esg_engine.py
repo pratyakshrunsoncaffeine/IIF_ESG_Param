@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 import xml.etree.ElementTree as ET
-from datetime import date, datetime, timedelta
-from difflib import SequenceMatcher
+from datetime import date, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 import pymupdf
 from esg.dictionary_loader import load_dictionary
+from esg.news import bodies_near_duplicate, retrieve_full_article, relevance_and_pillar, score_whole_article
 
 ROOT = Path(__file__).resolve().parent
 TAXONOMY = json.loads((ROOT / "esg_taxonomy.json").read_text(encoding="utf-8"))
@@ -34,8 +35,7 @@ NEGATIVE_REVIEW_THRESHOLD = 0.70
 NEWS_PILLAR_TARGETS = {"E": 20, "S": 20, "G": 50}
 NEWS_SCORE_WEIGHT = 0.70
 REPORT_SCORE_WEIGHT = 0.30
-MAX_ARTICLE_FETCHES_PER_COMPANY = sum(NEWS_PILLAR_TARGETS.values())
-MAX_ARTICLE_TEXT_FETCHES_PER_COMPANY = 15
+NEGATIVE_NEWS_PENALTY_PER_7 = 0.5
 
 # Only these Indian business-news publishers are admitted to the adverse-news
 # candidate set. Reuters and PTI are separate publisher groups; syndication or
@@ -187,20 +187,34 @@ def is_official_record_url(value: str) -> bool:
 
 
 def _news_entities(company: dict) -> list[str]:
-    values = ([company["company_name"]] if company.get("company_name") else [company["ticker"]]) + company.get("aliases", [])
-    return list(dict.fromkeys(value.strip() for value in values if value and value.strip()))
+    aliases = company.get("aliases", [])
+    if isinstance(aliases, str):
+        aliases = re.split(r"[;,|]+", aliases)
+    if not isinstance(aliases, (list, tuple, set)):
+        aliases = []
+    values = ([company["company_name"]] if company.get("company_name") else []) + list(aliases)
+    ticker = re.sub(r"\.(?:NS|BO)$", "", str(company.get("ticker", "")), flags=re.I)
+    if ticker:
+        values.append(ticker)
+    return list(dict.fromkeys(value.strip() for value in values if isinstance(value, str) and value.strip())) or [company["ticker"]]
 
 
 def _deduplicate_news(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame
-    frame = frame.drop_duplicates(subset=["ticker", "pillar", "canonical_url"]).reset_index(drop=True)
-    kept = []
-    for idx, row in frame.sort_values("published_at", ascending=False).iterrows():
-        duplicate = any(row["ticker"] == frame.loc[prior, "ticker"] and row["pillar"] == frame.loc[prior, "pillar"] and row.get("publisher", "") == frame.loc[prior].get("publisher", "") and SequenceMatcher(None, row["title"].lower(), frame.loc[prior, "title"].lower()).ratio() >= 0.94 for prior in kept)
-        if not duplicate:
-            kept.append(idx)
-    return frame.loc[kept].reset_index(drop=True)
+    # Discovery can find the same story through multiple terms, entities,
+    # sources and pillar searches. Keep one row per company + discovered URL,
+    # while retaining every queried pillar for the later body-based decision.
+    keys = [column for column in ("ticker", "canonical_url") if column in frame]
+    if not keys:
+        return frame.reset_index(drop=True)
+    rows = []
+    for _, group in frame.groupby(keys, sort=False, dropna=False):
+        row = group.iloc[0].copy()
+        row["queried_pillars"] = ",".join(dict.fromkeys(str(value) for value in group.get("pillar", []) if str(value)))
+        row["query_entities"] = ", ".join(dict.fromkeys(str(value) for value in group.get("query_entity", []) if str(value)))
+        rows.append(row)
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
 def scan_news_for_company(company: dict, scan_end: date | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -239,9 +253,10 @@ def scan_news_for_company(company: dict, scan_end: date | None = None) -> tuple[
                             host = (item.get("domain") or urlparse(url).netloc).lower().removeprefix("www.")
                             publisher = publisher_group(host)
                             if publisher:
-                                articles.append({"ticker": company["ticker"], "company_name": company.get("company_name", ""), "pillar": pillar, "query_entity": entity,
+                                articles.append({"ticker": company["ticker"], "company_name": company.get("company_name", ""), "aliases": company.get("aliases", []), "pillar": pillar, "query_entity": entity,
                                     "title": title, "url": url, "canonical_url": canonical_url(url), "domain": host, "publisher": publisher,
-                                    "published_at": item.get("seendate", ""), "language": item.get("language", ""), "source_country": item.get("sourcecountry", ""), "discovery_source": "GDELT"})
+                                    "published_at": item.get("seendate", ""), "language": item.get("language", ""), "source_country": item.get("sourcecountry", ""), "discovery_source": "GDELT",
+                                    "source_start": source_start.isoformat(), "source_end": scan_end.isoformat()})
                 except Exception as exc:
                     errors.append({"ticker": company["ticker"], "source": "GDELT", "pillar": pillar, "query": entity, "error": f"{type(exc).__name__}: {str(exc)[:250]}"})
                 query = f'"{entity}" ({term_block}) ({site_block}) after:{source_start.isoformat()} before:{(scan_end + timedelta(days=1)).isoformat()}'
@@ -263,9 +278,10 @@ def scan_news_for_company(company: dict, scan_end: date | None = None) -> tuple[
                             published = parsedate_to_datetime(item.findtext("pubDate", default="")).isoformat()
                         except Exception:
                             published = item.findtext("pubDate", default="")
-                        articles.append({"ticker": company["ticker"], "company_name": company.get("company_name", ""), "pillar": pillar, "query_entity": entity,
+                        articles.append({"ticker": company["ticker"], "company_name": company.get("company_name", ""), "aliases": company.get("aliases", []), "pillar": pillar, "query_entity": entity,
                             "title": title, "url": link, "canonical_url": canonical_url(link), "domain": source_name or urlparse(link).netloc, "publisher": publisher,
-                            "published_at": published, "language": "", "source_country": "India", "discovery_source": "Google News RSS"})
+                            "published_at": published, "language": "", "source_country": "India", "discovery_source": "Google News RSS",
+                            "source_start": source_start.isoformat(), "source_end": scan_end.isoformat()})
                 except Exception as exc:
                     errors.append({"ticker": company["ticker"], "source": "Google News RSS", "pillar": pillar, "query": entity, "error": f"{type(exc).__name__}: {str(exc)[:250]}"})
                 time.sleep(0.05)
@@ -276,65 +292,196 @@ def scan_news_for_company(company: dict, scan_end: date | None = None) -> tuple[
     return _deduplicate_news(pd.DataFrame(articles)), pd.DataFrame(errors), pd.DataFrame(coverage)
 
 
-def classify_news(candidates: pd.DataFrame, classifier) -> pd.DataFrame:
+def classify_news(candidates: pd.DataFrame, classifier, article_fetcher=None, progress_callback=None) -> pd.DataFrame:
     if candidates.empty:
         return candidates.copy()
     result = candidates.copy()
     result["article_text"] = ""
-    result["fetch_status"] = "headline only: article-text retrieval budget reached"
-    try:
-        import trafilatura
-    except ImportError:
-        trafilatura = None
-    for ticker, group in result.groupby("ticker"):
-        for pillar, pillar_group in group.groupby("pillar"):
-            limit = min(NEWS_PILLAR_TARGETS.get(str(pillar), 20), MAX_ARTICLE_TEXT_FETCHES_PER_COMPANY // len(NEWS_PILLAR_TARGETS))
-            ordered = pillar_group.sort_values("published_at", ascending=False, kind="stable")
-            for idx in list(ordered.index[:limit]):
-                if trafilatura is None:
-                    result.loc[idx, "fetch_status"] = "trafilatura is not installed"
-                    continue
-                try:
-                    downloaded = trafilatura.fetch_url(result.loc[idx, "url"])
-                    body = trafilatura.extract(downloaded, include_comments=False, include_tables=False, favor_recall=True) if downloaded else ""
-                    if body:
-                        result.loc[idx, "article_text"] = body[:5000]
-                        result.loc[idx, "fetch_status"] = "article text retrieved"
-                    else:
-                        result.loc[idx, "fetch_status"] = "publisher article unavailable; headline used"
-                except Exception as exc:
-                    result.loc[idx, "fetch_status"] = f"fetch failed: {type(exc).__name__}"
-                time.sleep(0.1)
-    result["model_input_source"] = result["article_text"].map(lambda text: "article text" if text else "headline only")
-    detected = []
-    from langdetect import detect, LangDetectException
-    for _, row in result.iterrows():
-        text = str(row["article_text"] or row["title"])
-        declared = str(row.get("language", "")).lower()
-        if declared in {"english", "en"}:
-            detected.append("en")
-            continue
+    defaults = {
+        "retrieval_state": "pending", "retrieval_reason": "", "full_article_available": False,
+        "google_news_resolution": "",
+        "relevance_decision": "pending", "relevance_reason": "", "scoring_eligible": False,
+        "attribution_evidence": "",
+        "detected_language": "unknown", "finbert_label": "not scored", "finbert_confidence": float("nan"),
+        "finbert_negative_probability": float("nan"), "needs_analyst_review": False,
+        "publication_window_valid": False, "publication_window_reason": "Publication window has not been checked",
+        "chunk_count": 0, "chunks_scored": 0, "token_count": 0, "full_text_scored": False,
+        "scoring_error": "", "duplicate_of": "",
+    }
+    for column, value in defaults.items():
+        result[column] = value
+    result["model_input_source"] = "none: no headline fallback"
+    result["fetch_status"] = "retrieval pending"
+    total = len(result)
+    domains_for = dict(APPROVED_NEWS_PUBLISHERS)
+
+    def progress(event, **details):
+        if progress_callback:
+            try:
+                progress_callback({"event": event, "total": total, **details})
+            except Exception:
+                pass
+
+    for processed, idx in enumerate(result.index, start=1):
+        row = result.loc[idx]
+        publisher = str(row.get("publisher", ""))
+        domains = domains_for.get(publisher, ())
+        progress("retrieval_started", ticker=row.get("ticker", ""), title=row.get("title", ""), processed=processed - 1)
         try:
-            detected.append(detect(text[:1200]))
-        except LangDetectException:
-            detected.append("unknown")
-    result["detected_language"] = detected
-    result["finbert_label"] = "not scored: language not identified as English"
-    result["finbert_confidence"] = float("nan")
-    result["finbert_negative_probability"] = float("nan")
-    result["needs_analyst_review"] = True
-    english_indices = list(result.index[result["detected_language"].eq("en")])
-    if english_indices:
-        texts = [str(result.loc[idx, "article_text"] or result.loc[idx, "title"])[:4000] for idx in english_indices]
-        predictions = classifier(texts, top_k=None, truncation=True, max_length=512, batch_size=4)
-        for idx, prediction in zip(english_indices, predictions):
-            scores = {item["label"].lower(): float(item["score"]) for item in prediction}
-            label = max(scores, key=scores.get)
-            result.loc[idx, "finbert_label"] = label
-            result.loc[idx, "finbert_confidence"] = scores[label]
-            result.loc[idx, "finbert_negative_probability"] = scores.get("negative", 0.0)
-            result.loc[idx, "needs_analyst_review"] = scores.get("negative", 0.0) >= NEGATIVE_REVIEW_THRESHOLD
+            if article_fetcher is None:
+                retrieval = retrieve_full_article(str(row.get("url", "")), domains)
+            else:
+                retrieval = article_fetcher(str(row.get("url", "")), domains)
+            if not isinstance(retrieval, dict):
+                raise TypeError("article_fetcher must return a retrieval metadata dictionary")
+        except Exception as exc:
+            retrieval = {"url": row.get("url", ""), "article_text": "", "retrieval_state": "failed", "retrieval_reason": f"{type(exc).__name__}: {exc}"}
+        direct_url = str(retrieval.get("url") or row.get("url", ""))
+        body = str(retrieval.get("article_text") or "")
+        state = str(retrieval.get("retrieval_state", "failed"))
+        reason = str(retrieval.get("retrieval_reason", ""))
+        if state == "retrieved" and (not publisher_group(direct_url) or publisher_group(direct_url) != publisher):
+            state, reason, body = "rejected_redirect", "Final URL is not an approved direct publisher URL", ""
+        available = state == "retrieved" and len(body.strip()) >= 500
+        if state == "retrieved" and not available:
+            state, reason = "too_short", "Extracted article body is shorter than the 500-character minimum"
+        result.at[idx, "url"] = direct_url
+        result.at[idx, "canonical_url"] = canonical_url(direct_url)
+        result.at[idx, "article_text"] = body
+        result.at[idx, "retrieval_state"] = state
+        result.at[idx, "retrieval_reason"] = reason
+        result.at[idx, "google_news_resolution"] = str(retrieval.get("google_news_resolution", ""))
+        result.at[idx, "full_article_available"] = available
+        result.at[idx, "fetch_status"] = reason
+        result.at[idx, "model_input_source"] = "full article" if available else "none: no headline fallback"
+        progress("retrieval_complete", ticker=row.get("ticker", ""), processed=processed,
+                 retrieval_state=state, full_article_available=available)
+        if not available:
+            result.at[idx, "relevance_decision"] = "not evaluated"
+            result.at[idx, "relevance_reason"] = "Full article retrieval did not produce a usable body"
+            continue
+
+        window_start, window_end = row.get("source_start"), row.get("source_end")
+        if pd.isna(window_start) or pd.isna(window_end):
+            window_valid, window_reason = True, "No discovery date bounds were supplied"
+        else:
+            published = pd.to_datetime(row.get("published_at", ""), errors="coerce", utc=True)
+            try:
+                start_date = pd.to_datetime(window_start, errors="raise", utc=True).date()
+                end_date = pd.to_datetime(window_end, errors="raise", utc=True).date()
+            except Exception:
+                start_date, end_date = None, None
+            window_valid = bool(
+                pd.notna(published) and start_date is not None and end_date is not None
+                and start_date <= published.date() <= end_date
+            )
+            window_reason = "Published date is inside the requested search window" if window_valid else "Publication date is missing, invalid or outside the requested search window"
+        result.at[idx, "publication_window_valid"] = window_valid
+        result.at[idx, "publication_window_reason"] = window_reason
+        if not window_valid:
+            result.at[idx, "relevance_decision"] = "not evaluated"
+            result.at[idx, "relevance_reason"] = window_reason
+            continue
+
+        company = {"company_name": str(row.get("company_name", "")), "aliases": row.get("aliases", [])}
+        if isinstance(company["aliases"], str):
+            company["aliases"] = [value.strip() for value in company["aliases"].split("|") if value.strip()]
+        queried = str(row.get("queried_pillars", row.get("pillar", ""))).split(",")
+        queried_pillar = next((value.strip() for value in queried if value.strip() in PILLAR_NAMES), "")
+        relevant, decision, relevance_reason, material_pillar, attribution_evidence = relevance_and_pillar(
+            body, company, str(row.get("ticker", "")), queried_pillar, NEWS_EVENT_TERMS,
+        )
+        result.at[idx, "relevance_decision"] = decision
+        result.at[idx, "relevance_reason"] = relevance_reason
+        result.at[idx, "attribution_evidence"] = attribution_evidence
+        if not relevant:
+            continue
+        result.at[idx, "pillar"] = material_pillar
+        try:
+            from langdetect import detect
+            language = detect(body[:10000])
+        except Exception:
+            language = "unknown"
+        result.at[idx, "detected_language"] = language
+        if language != "en":
+            result.at[idx, "relevance_reason"] = f"{relevance_reason}; full article language is {language}, and FinBERT scoring is English-only"
+            continue
+        scored = score_whole_article(
+            body, classifier,
+            progress_callback=lambda event_details: progress(
+                "chunk_scored", ticker=row.get("ticker", ""), processed=processed, **event_details,
+            ),
+        )
+        for column, value in scored.items():
+            result.at[idx, column] = value
+        result.at[idx, "needs_analyst_review"] = bool(
+            scored.get("full_text_scored") and scored.get("finbert_negative_probability", 0.0) >= NEGATIVE_REVIEW_THRESHOLD
+        )
+        eligible = bool(scored.get("full_text_scored") and scored.get("chunks_scored") == scored.get("chunk_count") and publisher_group(direct_url) == publisher)
+        result.at[idx, "scoring_eligible"] = eligible
+        if not eligible and scored.get("scoring_error"):
+            result.at[idx, "relevance_reason"] = f"{relevance_reason}; full-text scoring failed: {scored['scoring_error']}"
+        progress("article_scored", ticker=row.get("ticker", ""), processed=processed,
+                 chunk_count=scored.get("chunk_count", 0), chunks_scored=scored.get("chunks_scored", 0),
+                 full_text_scored=scored.get("full_text_scored", False), scoring_eligible=eligible)
+
+    # Syndicated copies can arrive from multiple approved publishers. Keep all
+    # records for audit, but only the first full-text copy can enter scoring.
+    processed_bodies = []
+    for idx in result.index[result["scoring_eligible"]].tolist():
+        ticker = str(result.at[idx, "ticker"])
+        body = str(result.at[idx, "article_text"])
+        duplicate = next((prior for prior in processed_bodies if prior[0] == ticker and bodies_near_duplicate(prior[2], body)), None)
+        if duplicate:
+            result.at[idx, "scoring_eligible"] = False
+            result.at[idx, "duplicate_of"] = duplicate[1]
+            result.at[idx, "relevance_reason"] = "Syndicated or near-identical full article already counted from " + duplicate[1]
+        else:
+            processed_bodies.append((ticker, str(result.at[idx, "url"]), body))
     return result
+
+
+def _eligible_unique_news(news: pd.DataFrame) -> pd.DataFrame:
+    """Fail closed: only verified, full-text, fully scored articles enter metrics."""
+    required = {
+        "ticker", "pillar", "url", "article_text", "retrieval_state", "full_article_available",
+        "relevance_decision", "scoring_eligible", "detected_language", "full_text_scored",
+        "publication_window_valid", "chunk_count", "chunks_scored", "finbert_negative_probability",
+    }
+    if news.empty or not required.issubset(news.columns):
+        return pd.DataFrame(columns=list(required))
+    rows = news.copy()
+    probabilities = pd.to_numeric(rows["finbert_negative_probability"], errors="coerce")
+    lengths = rows["article_text"].fillna("").astype(str).str.strip().str.len()
+    truthy = lambda column: rows[column].map(lambda value: str(value).strip().lower() == "true")
+    mask = (
+        truthy("scoring_eligible")
+        & truthy("full_article_available")
+        & truthy("full_text_scored")
+        & truthy("publication_window_valid")
+        & rows["retrieval_state"].eq("retrieved")
+        & rows["relevance_decision"].eq("accepted")
+        & rows["detected_language"].eq("en")
+        & pd.to_numeric(rows["chunk_count"], errors="coerce").fillna(0).gt(0)
+        & pd.to_numeric(rows["chunks_scored"], errors="coerce").eq(pd.to_numeric(rows["chunk_count"], errors="coerce"))
+        & lengths.ge(500)
+        & probabilities.between(0.0, 1.0, inclusive="both")
+    )
+    rows = rows.loc[mask].copy()
+    rows["finbert_negative_probability"] = probabilities.loc[rows.index]
+    rows = rows[rows.apply(lambda row: publisher_group(str(row["url"])) in APPROVED_NEWS_PUBLISHERS, axis=1)]
+    kept = []
+    seen_urls = set()
+    for idx, row in rows.iterrows():
+        url = canonical_url(str(row["url"]))
+        ticker = str(row["ticker"])
+        if (ticker, url) in seen_urls:
+            continue
+        if any(str(rows.loc[prior, "ticker"]) == ticker and bodies_near_duplicate(str(rows.loc[prior, "article_text"]), str(row["article_text"])) for prior in kept):
+            continue
+        seen_urls.add((ticker, url))
+        kept.append(idx)
+    return rows.loc[kept].copy()
 
 
 def apply_incidents_and_rank(document_scores: pd.DataFrame, incidents: pd.DataFrame, news: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -364,20 +511,18 @@ def apply_incidents_and_rank(document_scores: pd.DataFrame, incidents: pd.DataFr
             penalties[key] += severity
     detail = document_scores.copy()
     detail["approved_incident_penalty"] = [penalties[(r.ticker, r.pillar)] for r in detail.itertuples()]
-    if not news.empty and {"ticker", "pillar"}.issubset(news.columns):
-        coverage_counts = news.groupby(["ticker", "pillar"]).size().to_dict()
-    else:
-        coverage_counts = {}
+    usable_news = _eligible_unique_news(news)
+    coverage_counts = usable_news.groupby(["ticker", "pillar"]).size().to_dict() if not usable_news.empty else {}
     detail["news_articles_found"] = [int(coverage_counts.get((r.ticker, r.pillar), 0)) for r in detail.itertuples()]
     detail["news_article_target"] = detail["pillar"].map(NEWS_PILLAR_TARGETS).fillna(20).astype(int)
     detail["news_target_met"] = detail["news_articles_found"] >= detail["news_article_target"]
     # FinBERT sentiment contributes to the news-heavy provisional score, but
     # incomplete coverage or missing model outputs are neutral, never clean.
-    if not news.empty and {"ticker", "pillar", "finbert_negative_probability"}.issubset(news.columns):
-        probabilities = pd.to_numeric(news["finbert_negative_probability"], errors="coerce")
-        usable_news = news.loc[probabilities.notna(), ["ticker", "pillar"]].copy()
-        usable_news["negative_probability"] = probabilities[probabilities.notna()]
-        mean_negative = usable_news.groupby(["ticker", "pillar"])["negative_probability"].mean().to_dict()
+    if not usable_news.empty and "finbert_negative_probability" in usable_news:
+        probabilities = pd.to_numeric(usable_news["finbert_negative_probability"], errors="coerce")
+        scored_news = usable_news.loc[probabilities.notna(), ["ticker", "pillar"]].copy()
+        scored_news["negative_probability"] = probabilities[probabilities.notna()]
+        mean_negative = scored_news.groupby(["ticker", "pillar"])["negative_probability"].mean().to_dict()
     else:
         mean_negative = {}
     detail["news_average_negative_probability"] = [mean_negative.get((r.ticker, r.pillar), float("nan")) for r in detail.itertuples()]
@@ -401,24 +546,29 @@ def apply_incidents_and_rank(document_scores: pd.DataFrame, incidents: pd.DataFr
     detail["report_weighted_component"] = (detail["document_evidence_score_0_7"] * REPORT_SCORE_WEIGHT).round(2)
     detail["news_weighted_component"] = (detail["news_risk_score_0_7"] * NEWS_SCORE_WEIGHT).round(2)
     detail["provisional_score_0_7"] = (detail["report_weighted_component"] + detail["news_weighted_component"]).round(2)
-    if not news.empty and {"ticker", "pillar"}.issubset(news.columns):
-        neg = news[news.get("finbert_negative_probability", pd.Series(index=news.index, dtype=float)) >= NEGATIVE_REVIEW_THRESHOLD].groupby(["ticker", "pillar"]).size().to_dict() if "finbert_negative_probability" in news else {}
-    else:
-        neg = {}
+    neg = usable_news[pd.to_numeric(usable_news.get("finbert_negative_probability", pd.Series(index=usable_news.index, dtype=float)), errors="coerce") >= NEGATIVE_REVIEW_THRESHOLD].groupby(["ticker", "pillar"]).size().to_dict() if not usable_news.empty else {}
     detail["negative_news_candidates"] = [int(neg.get((r.ticker, r.pillar), 0)) for r in detail.itertuples()]
     ranking = detail.groupby(["ticker", "company_name"], as_index=False).agg(
-        overall_score_0_21=("provisional_score_0_7", "sum"),
+        overall_score_before_negative_news_penalty=("provisional_score_0_7", "sum"),
         negative_news_candidates=("negative_news_candidates", "sum"),
         news_articles_found=("news_articles_found", "sum"),
         news_article_targets=("news_article_target", "sum"),
         news_targets_met=("news_target_met", "all"),
     )
-    ranking["overall_score_0_21"] = ranking["overall_score_0_21"].round(2)
+    # Discrete whole-company deduction: 0.5 points per seven eligible
+    # negative articles, rounded half-up, kept separate for auditability.
+    ranking["negative_news_penalty"] = ranking["negative_news_candidates"].map(
+        lambda count: math.floor((int(count) * NEGATIVE_NEWS_PENALTY_PER_7 / 7) + 0.5)
+    )
+    ranking["overall_score_before_negative_news_penalty"] = ranking["overall_score_before_negative_news_penalty"].round(2)
+    ranking["overall_score_0_21"] = (
+        ranking["overall_score_before_negative_news_penalty"] - ranking["negative_news_penalty"]
+    ).clip(lower=0).round(2)
     ranking["esg_rank"] = ranking["overall_score_0_21"].rank(method="min", ascending=False).astype(int)
     pivot = detail.pivot_table(index="ticker", columns="pillar", values="provisional_score_0_7", aggfunc="first").reset_index()
     for pillar in pillars:
         if pillar not in pivot:
             pivot[pillar] = 0.0
     ranking = ranking.merge(pivot, on="ticker", how="left").rename(columns={"E": "E_score_0_7", "S": "S_score_0_7", "G": "G_score_0_7"})
-    detail = detail.merge(ranking[["ticker", "overall_score_0_21", "esg_rank"]], on="ticker", how="left")
+    detail = detail.merge(ranking[["ticker", "negative_news_penalty", "overall_score_before_negative_news_penalty", "overall_score_0_21", "esg_rank"]], on="ticker", how="left")
     return ranking.sort_values(["esg_rank", "ticker"]).reset_index(drop=True), detail.sort_values(["esg_rank", "pillar"]).reset_index(drop=True)

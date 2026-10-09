@@ -7,7 +7,8 @@ from collections import defaultdict
 from pathlib import Path
 
 COLUMNS = [
-    ("Ticker", "ticker"), ("Company", "company"), ("Source File", "source_file"),
+    ("Ticker", "ticker"), ("Company", "company"), ("Document Type", "document_type"),
+    ("Fiscal Year", "fiscal_year"), ("Source File", "source_file"),
     ("Page Number", "page_number"),
     ("ESG Pillar", "pillar"), ("ESG Topic", "topic"),
     ("Matched Keywords", "matched_keywords"), ("Primary Keyword", "keyword"),

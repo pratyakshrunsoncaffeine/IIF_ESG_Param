@@ -11,14 +11,16 @@ TRACEABILITY_CUES = re.compile(
 )
 
 SCORE_COLUMNS = [
-    "ticker", "company_name", "report_name", "pillar", "pillar_name", "topic",
+    "ticker", "company_name", "report_name", "document_type", "fiscal_year", "source_file", "pillar", "pillar_name", "topic",
     "page", "keyword_hits", "numeric_signal", "period_signal", "progress_signal",
     "traceability_signal", "evidence_excerpt",
 ]
 
 
 def records_to_score_evidence(records: list[dict], ticker: str,
-                              company_name: str, report_name: str) -> list[dict]:
+                              company_name: str, report_name: str,
+                              document_type: str = "annual_report",
+                              fiscal_year: str = "") -> list[dict]:
     """Keep score inputs tied to the original page and extracted statement."""
     rows = []
     for record in records:
@@ -34,6 +36,9 @@ def records_to_score_evidence(records: list[dict], ticker: str,
             "ticker": ticker,
             "company_name": company_name or ticker,
             "report_name": report_name,
+            "document_type": document_type,
+            "fiscal_year": fiscal_year or record.get("fiscal_year", ""),
+            "source_file": record.get("source_file", report_name),
             "pillar": PILLAR_CODES.get(pillar_name, ""),
             "pillar_name": pillar_name,
             "topic": record.get("topic", ""),
