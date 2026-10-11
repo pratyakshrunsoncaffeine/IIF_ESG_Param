@@ -14,7 +14,7 @@ import pandas as pd
 import requests
 import pymupdf
 from esg.dictionary_loader import load_dictionary
-from esg.news import bodies_near_duplicate, retrieve_full_article, relevance_and_pillar, score_whole_article
+from esg.news import bodies_near_duplicate, retrieve_full_article, relevance_and_pillar, score_whole_article, is_news_article_url
 
 ROOT = Path(__file__).resolve().parent
 TAXONOMY = json.loads((ROOT / "esg_taxonomy.json").read_text(encoding="utf-8"))
@@ -345,6 +345,8 @@ def classify_news(candidates: pd.DataFrame, classifier, article_fetcher=None, pr
         reason = str(retrieval.get("retrieval_reason", ""))
         if state == "retrieved" and (not publisher_group(direct_url) or publisher_group(direct_url) != publisher):
             state, reason, body = "rejected_redirect", "Final URL is not an approved direct publisher URL", ""
+        if state == "retrieved" and not is_news_article_url(direct_url):
+            state, reason, body = "not_article", "URL identifies a news listing rather than a single article", ""
         available = state == "retrieved" and len(body.strip()) >= 500
         if state == "retrieved" and not available:
             state, reason = "too_short", "Extracted article body is shorter than the 500-character minimum"
@@ -507,7 +509,9 @@ def _eligible_unique_news(news: pd.DataFrame) -> pd.DataFrame:
     probabilities = pd.to_numeric(rows["finbert_negative_probability"], errors="coerce")
     lengths = rows["article_text"].fillna("").astype(str).str.strip().str.len()
     truthy = lambda column: rows[column].map(lambda value: str(value).strip().lower() == "true")
-    full = truthy("full_article_available") & truthy("full_text_scored") & rows["retrieval_state"].eq("retrieved") & lengths.ge(500)
+    full = (truthy("full_article_available") & truthy("full_text_scored")
+            & rows["retrieval_state"].eq("retrieved") & lengths.ge(500)
+            & rows["url"].map(is_news_article_url))
     headline = (rows.get("headline_scored", pd.Series(False, index=rows.index)).eq(True)
                 & ~truthy("full_article_available") & ~truthy("full_text_scored")
                 & rows.get("model_input_source", pd.Series("", index=rows.index)).eq("headline only")

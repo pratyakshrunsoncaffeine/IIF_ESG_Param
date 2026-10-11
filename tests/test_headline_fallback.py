@@ -7,6 +7,7 @@ import pytest
 
 from esg_engine import classify_news, apply_incidents_and_rank, _eligible_unique_news
 from esg.database import save_evidence_batch, read_table
+from esg.news import is_news_article_url, retrieve_full_article
 
 
 class Tokenizer:
@@ -170,3 +171,38 @@ def test_headline_fallback_database_roundtrip(tmp_path):
     assert restored["headline_scored"]
     assert restored["negative_evidence_weight"] == .5
     assert restored["effective_negative_probability"] == .4
+
+
+def test_topic_page_cannot_be_counted_as_full_article_even_from_cached_text():
+    body = "RBI fined HDFC Bank for a regulatory breach. " + "Unrelated listing material. " * 40
+    rows = pd.DataFrame([candidate(url="https://livemint.com/topic/banking")])
+    news = classify_news(rows, NegativeClassifier(), article_fetcher=lambda url, _: {
+        "url": url, "article_text": body, "retrieval_state": "retrieved"})
+    assert news.iloc[0].retrieval_state == "not_article"
+    assert news.iloc[0].headline_scored and not news.iloc[0].full_text_scored
+    assert news.iloc[0].negative_evidence_weight == .5
+    forged = news.copy()
+    forged["full_article_available"] = True
+    forged["full_text_scored"] = True
+    forged["retrieval_state"] = "retrieved"
+    forged["article_text"] = body
+    assert _eligible_unique_news(forged).empty
+
+
+def test_generic_topic_headline_is_rejected_without_reading_listing():
+    news = classify_news(pd.DataFrame([candidate(url="https://livemint.com/topic/banking",
+        title="Business News Live, Share Market News, Finance News")]), NegativeClassifier(), article_fetcher=blocked)
+    assert not news.iloc[0].scoring_eligible
+
+
+def test_home_topic_and_search_pages_are_not_article_urls():
+    assert not is_news_article_url("https://economictimes.indiatimes.com/topic/microsoft-visa")
+    assert not is_news_article_url("https://reuters.com/")
+    assert not is_news_article_url("https://livemint.com/search/banking")
+    assert is_news_article_url("https://reuters.com/world/india/company-regulator-action-2026-10-10/")
+    class NoNetwork:
+        def get(self, *args, **kwargs):
+            raise AssertionError("A topic page must not be fetched as an article")
+    result = retrieve_full_article("https://economictimes.indiatimes.com/topic/microsoft-visa",
+                                   ("economictimes.indiatimes.com",), session=NoNetwork())
+    assert result["retrieval_state"] == "not_article"

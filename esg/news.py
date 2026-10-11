@@ -73,6 +73,17 @@ def is_approved_url(url: str, publisher_domains: tuple[str, ...]) -> bool:
     return bool(host and any(host == domain or host.endswith("." + domain) for domain in publisher_domains))
 
 
+def is_news_article_url(url: str) -> bool:
+    """Reject home and topic/search directories which combine unrelated stories."""
+    parsed = urlparse(str(url or ""))
+    path = parsed.path.strip("/").lower()
+    if parsed.scheme not in {"http", "https"} or not path:
+        return False
+    if re.search(r"(?:^|/)(?:topic|topics|tag|tags|search|category|categories|section|sections)(?:/|$)", path):
+        return False
+    return path not in {"news", "business", "markets", "world", "companies", "economy", "world/india"}
+
+
 def resolve_google_news_url(url: str, publisher_domains: tuple[str, ...], decoder=None) -> tuple[str, str]:
     """Resolve modern Google News links with a bounded decoder call."""
     try:
@@ -111,10 +122,16 @@ def retrieve_full_article(url: str, publisher_domains: tuple[str, ...], session=
             if not requested_url:
                 return {"url": url, "article_text": "", "retrieval_state": "unresolved_google_news", "retrieval_reason": decoder_reason}
             resolution_note = decoder_reason
+        if not is_news_article_url(requested_url):
+            return {"url": requested_url, "article_text": "", "retrieval_state": "not_article",
+                    "retrieval_reason": "URL is a home, topic or search page, not a single news article"}
         response = client.get(requested_url, timeout=30, headers={"User-Agent": "Mozilla/5.0 (compatible; IIF-ESG-Research/1.0)"})
         direct_url = response.url or url
         if not is_approved_url(direct_url, publisher_domains):
             return {"url": direct_url, "article_text": "", "retrieval_state": "rejected_redirect", "retrieval_reason": "Resolved URL is outside the approved publisher domains"}
+        if not is_news_article_url(direct_url):
+            return {"url": direct_url, "article_text": "", "retrieval_state": "not_article",
+                    "retrieval_reason": "Redirect resolves to a home, topic or search page, not a single news article"}
         if response.status_code in (401, 403, 402):
             return {"url": direct_url, "article_text": "", "retrieval_state": "blocked", "retrieval_reason": f"Publisher returned HTTP {response.status_code}"}
         response.raise_for_status()
